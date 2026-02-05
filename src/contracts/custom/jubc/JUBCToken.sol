@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.10;
 
-import {GhoToken} from 'gho-origin/gho/GhoToken.sol';
+import {GhoToken} from 'custom/gho/GhoToken.sol';
 
 /**
  * @title AIEN Token (ZaiBots AI Economic Nation)

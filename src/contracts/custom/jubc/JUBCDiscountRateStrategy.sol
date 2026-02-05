@@ -1,7 +1,7 @@
 // // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.10;
 
-import {GhoDiscountRateStrategy} from 'gho-origin/facilitators/aave/interestStrategy/GhoDiscountRateStrategy.sol';
+import {GhoDiscountRateStrategy} from 'custom/gho/GhoDiscountRateStrategy.sol';
 
 contract JUBCDiscountRateStrategy is GhoDiscountRateStrategy {}
 

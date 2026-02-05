@@ -2,6 +2,9 @@
   "lib/forge-std": {
     "rev": "999be66ec94c78090087f674bbf52ce1cca12b75"
   },
+  "lib/gho-origin": {
+    "rev": "d2d9ffb2d2a0a532d98e570add9d4262cecfb30b"
+  },
   "lib/solidity-utils": {
     "rev": "47895e3b09d29abee1165a07db643362537911c6"
   }
