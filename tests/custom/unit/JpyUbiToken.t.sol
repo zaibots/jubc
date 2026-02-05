@@ -2,7 +2,7 @@
 pragma solidity ^0.8.10;
 
 import {Test, console2, stdError} from 'forge-std/Test.sol';
-import {JUBCToken} from 'custom/jubc/JUBCToken.sol';
+import {MockJUBCToken} from '../lib/MockJUBCToken.sol';
 
 /**
  * @title JUBCTokenTest
@@ -17,7 +17,7 @@ import {JUBCToken} from 'custom/jubc/JUBCToken.sol';
  *      - Fuzzing on all numeric parameters
  */
 contract JUBCTokenTest is Test {
-  JUBCToken public jpyUbi;
+  MockJUBCToken public jpyUbi;
 
   address public admin;
   address public facilitatorManager;
@@ -58,7 +58,7 @@ contract JUBCTokenTest is Test {
     attacker = makeAddr('attacker');
 
     vm.startPrank(admin);
-    jpyUbi = new JUBCToken(admin);
+    jpyUbi = new MockJUBCToken(admin);
     jpyUbi.grantRole(FACILITATOR_MANAGER_ROLE, facilitatorManager);
     jpyUbi.grantRole(BUCKET_MANAGER_ROLE, bucketManager);
     vm.stopPrank();
@@ -69,8 +69,8 @@ contract JUBCTokenTest is Test {
   // ══════════════════════════════════════════════════════════════════════════════
 
   function test_constructor_setsCorrectNameAndSymbol() public view {
-    assertEq(jpyUbi.name(), 'ZaiBots AI Economic Nation');
-    assertEq(jpyUbi.symbol(), 'AIEN');
+    assertEq(jpyUbi.name(), 'Mock JUBC Token');
+    assertEq(jpyUbi.symbol(), 'mJUBC');
     assertEq(jpyUbi.decimals(), 18);
   }
 
@@ -80,7 +80,7 @@ contract JUBCTokenTest is Test {
 
   function testFuzz_constructor_anyAdmin(address _admin) external {
     vm.assume(_admin != address(0));
-    JUBCToken token = new JUBCToken(_admin);
+    MockJUBCToken token = new MockJUBCToken(_admin);
     assertTrue(token.hasRole(DEFAULT_ADMIN_ROLE, _admin));
   }
 
@@ -99,7 +99,7 @@ contract JUBCTokenTest is Test {
     jpyUbi.addFacilitator(facilitator1, 'Facilitator 1', DEFAULT_BUCKET_CAPACITY);
 
     // Verify facilitator was added
-    JUBCToken.Facilitator memory f = jpyUbi.getFacilitator(facilitator1);
+    MockJUBCToken.Facilitator memory f = jpyUbi.getFacilitator(facilitator1);
     assertEq(f.label, 'Facilitator 1');
     assertEq(f.bucketCapacity, DEFAULT_BUCKET_CAPACITY);
   }
@@ -119,7 +119,7 @@ contract JUBCTokenTest is Test {
     jpyUbi.removeFacilitator(facilitator1);
 
     // Verify facilitator was removed
-    JUBCToken.Facilitator memory f = jpyUbi.getFacilitator(facilitator1);
+    MockJUBCToken.Facilitator memory f = jpyUbi.getFacilitator(facilitator1);
     assertEq(f.label, '');
   }
 
@@ -204,7 +204,7 @@ contract JUBCTokenTest is Test {
     vm.prank(attacker);
     jpyUbi.addFacilitator(facilitator1, 'Facilitator 1', DEFAULT_BUCKET_CAPACITY);
 
-    JUBCToken.Facilitator memory f = jpyUbi.getFacilitator(facilitator1);
+    MockJUBCToken.Facilitator memory f = jpyUbi.getFacilitator(facilitator1);
     assertEq(f.label, 'Facilitator 1');
   }
 
@@ -232,7 +232,7 @@ contract JUBCTokenTest is Test {
     vm.prank(facilitatorManager);
     jpyUbi.removeFacilitator(facilitator1);
 
-    JUBCToken.Facilitator memory f = jpyUbi.getFacilitator(facilitator1);
+    MockJUBCToken.Facilitator memory f = jpyUbi.getFacilitator(facilitator1);
     assertEq(f.label, '');
   }
 

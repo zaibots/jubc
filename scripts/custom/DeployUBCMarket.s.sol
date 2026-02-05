@@ -20,12 +20,16 @@ import {IPoolAddressesProvider} from '../../src/contracts/interfaces/IPoolAddres
 import {ConfiguratorInputTypes} from '../../src/contracts/protocol/libraries/types/ConfiguratorInputTypes.sol';
 
 // Custom protocol imports
-import {JUBCToken} from 'custom/jubc/JUBCToken.sol';
-import {JUBCDiscountRateStrategy} from 'custom/jubc/JUBCDiscountRateStrategy.sol';
 import {DataStreamAggregatorAdapter} from 'custom/oracles/DataStreamAggregatorAdapter.sol';
 import {JpyUbiAMOMinter} from 'custom/amo/JpyUbiAMOMinter.sol';
 import {JpyUbiConvexAMO} from 'custom/amo/JpyUbiConvexAMO.sol';
 import {MorphoVaultV1Adapter} from 'custom/integrations/morpho/adapters/MorphoVaultV1Adapter.sol';
+
+// Interface for jUBC token (GHO-compatible)
+interface IJUBCToken {
+  function grantRole(bytes32 role, address account) external;
+  function addFacilitator(address facilitator, string calldata label, uint128 capacity) external;
+}
 
 /**
  * @title DeployUBCMarket
@@ -37,9 +41,8 @@ contract DeployUBCMarket is DeployUtils, MarketInput, Script {
   // CUSTOM DEPLOYED CONTRACTS
   // ══════════════════════════════════════════════════════════════════════════════
 
-  JUBCToken public jUBCToken;
+  address public jUBCToken;
   DataStreamAggregatorAdapter public jpyUsdOracle;
-  JUBCDiscountRateStrategy public discountRateStrategy;
   JpyUbiAMOMinter public amoMinter;
   MorphoVaultV1Adapter public morphoAdapter;
 
@@ -142,13 +145,11 @@ contract DeployUBCMarket is DeployUtils, MarketInput, Script {
     console2.log('  ACLManager:', report.aclManager);
 
     // ════════════════════════════════════════════════════════════════════════════
-    // STEP 2: Deploy custom jUBC Token (GHO fork)
+    // STEP 2: Use existing jUBC Token (passed via JUBC_TOKEN env var)
     // ════════════════════════════════════════════════════════════════════════════
     console2.log('');
-    console2.log('>>> Step 2: Deploying jUBC Token (GHO fork)...');
-
-    jUBCToken = new JUBCToken(admin);
-    console2.log('  JUBCToken:', address(jUBCToken));
+    console2.log('>>> Step 2: Using existing jUBC Token...');
+    console2.log('  JUBCToken:', jUBCToken);
 
     // ════════════════════════════════════════════════════════════════════════════
     // STEP 3: Deploy Oracle
@@ -160,13 +161,10 @@ contract DeployUBCMarket is DeployUtils, MarketInput, Script {
     console2.log('  JpyUsdOracle:', address(jpyUsdOracle));
 
     // ════════════════════════════════════════════════════════════════════════════
-    // STEP 4: Deploy Discount Rate Strategy
+    // STEP 4: Discount Rate Strategy (skipped - deploy separately if needed)
     // ════════════════════════════════════════════════════════════════════════════
     console2.log('');
-    console2.log('>>> Step 4: Deploying Discount Rate Strategy...');
-
-    discountRateStrategy = new JUBCDiscountRateStrategy();
-    console2.log('  DiscountRateStrategy:', address(discountRateStrategy));
+    console2.log('>>> Step 4: Discount Rate Strategy skipped (deploy separately if needed)');
 
     // ════════════════════════════════════════════════════════════════════════════
     // STEP 5: Deploy AMO Minter
@@ -175,7 +173,7 @@ contract DeployUBCMarket is DeployUtils, MarketInput, Script {
     console2.log('>>> Step 5: Deploying AMO Minter...');
 
     uint256 globalMintCap = 100_000_000e18; // 100M jUBC
-    amoMinter = new JpyUbiAMOMinter(address(jUBCToken), globalMintCap);
+    amoMinter = new JpyUbiAMOMinter(jUBCToken, globalMintCap);
     console2.log('  AMOMinter:', address(amoMinter));
 
     // ════════════════════════════════════════════════════════════════════════════
@@ -187,8 +185,8 @@ contract DeployUBCMarket is DeployUtils, MarketInput, Script {
     bytes32 FACILITATOR_MANAGER_ROLE = keccak256('FACILITATOR_MANAGER_ROLE');
     bytes32 BUCKET_MANAGER_ROLE = keccak256('BUCKET_MANAGER_ROLE');
 
-    jUBCToken.grantRole(FACILITATOR_MANAGER_ROLE, admin);
-    jUBCToken.grantRole(BUCKET_MANAGER_ROLE, admin);
+    IJUBCToken(jUBCToken).grantRole(FACILITATOR_MANAGER_ROLE, admin);
+    IJUBCToken(jUBCToken).grantRole(BUCKET_MANAGER_ROLE, admin);
     jpyUsdOracle.setKeeperAuthorization(admin, true);
 
     console2.log('  Roles configured');
@@ -210,7 +208,7 @@ contract DeployUBCMarket is DeployUtils, MarketInput, Script {
     // The aToken will be the facilitator that can mint/burn jUBC
     // Need to get the aToken address after reserve init
     // For now, add the pool as facilitator with high capacity
-    jUBCToken.addFacilitator(report.poolProxy, 'Aave V3 Pool', 500_000_000e18); // 500M capacity
+    IJUBCToken(jUBCToken).addFacilitator(report.poolProxy, 'Aave V3 Pool', 500_000_000e18); // 500M capacity
     console2.log('  Pool added as facilitator');
 
     vm.stopBroadcast();
@@ -235,6 +233,10 @@ contract DeployUBCMarket is DeployUtils, MarketInput, Script {
     admin = vm.envOr('ADMIN', msg.sender);
     treasuryAddress = vm.envOr('TREASURY', msg.sender);
 
+    // jUBC token address (required - must be deployed separately)
+    jUBCToken = vm.envAddress('JUBC_TOKEN');
+    require(jUBCToken != address(0), 'JUBC_TOKEN env var required');
+
     // Chainlink Data Streams config
     verifierProxy = vm.envOr('VERIFIER_PROXY', address(0x2ff010DEbC1297f19579B4246cad07bd24F2488A));
     jpyUsdFeedId = vm.envOr('JPY_USD_FEED_ID', keccak256('JPY/USD'));
@@ -252,7 +254,7 @@ contract DeployUBCMarket is DeployUtils, MarketInput, Script {
     // Set jUBC price in oracle
     address[] memory assets = new address[](1);
     address[] memory sources = new address[](1);
-    assets[0] = address(jUBCToken);
+    assets[0] = jUBCToken;
     sources[0] = address(jpyUsdOracle);
     oracle.setAssetSources(assets, sources);
 
@@ -269,7 +271,7 @@ contract DeployUBCMarket is DeployUtils, MarketInput, Script {
     initInputs[0] = ConfiguratorInputTypes.InitReserveInput({
       aTokenImpl: report.aToken,
       variableDebtTokenImpl: report.variableDebtToken,
-      underlyingAsset: address(jUBCToken),
+      underlyingAsset: jUBCToken,
       aTokenName: 'ZaiBots jUBC',
       aTokenSymbol: 'aJUBC',
       variableDebtTokenName: 'ZaiBots Variable Debt jUBC',
@@ -281,20 +283,20 @@ contract DeployUBCMarket is DeployUtils, MarketInput, Script {
     configurator.initReserves(initInputs);
 
     // Configure jUBC reserve parameters (borrow-only, no collateral)
-    configurator.setReserveBorrowing(address(jUBCToken), true);
-    configurator.setBorrowCap(address(jUBCToken), 500_000_000); // 500M jUBC borrow cap
-    configurator.setReserveFlashLoaning(address(jUBCToken), false);
+    configurator.setReserveBorrowing(jUBCToken, true);
+    configurator.setBorrowCap(jUBCToken, 500_000_000); // 500M jUBC borrow cap
+    configurator.setReserveFlashLoaning(jUBCToken, false);
 
     // jUBC is not collateral (LTV = 0)
     configurator.configureReserveAsCollateral(
-      address(jUBCToken),
+      jUBCToken,
       0, // ltv
       0, // liquidationThreshold
       0 // liquidationBonus
     );
 
     // Enable borrowing in isolation mode
-    configurator.setBorrowableInIsolation(address(jUBCToken), true);
+    configurator.setBorrowableInIsolation(jUBCToken, true);
 
     console2.log('  jUBC reserve configured');
   }
@@ -323,36 +325,10 @@ contract DeployUBCMarket is DeployUtils, MarketInput, Script {
     console2.log('RewardsController:', report.rewardsControllerProxy);
     console2.log('');
     console2.log('--- Custom Contracts ---');
-    console2.log('JUBCToken:', address(jUBCToken));
+    console2.log('JUBCToken:', jUBCToken);
     console2.log('JpyUsdOracle:', address(jpyUsdOracle));
-    console2.log('DiscountRateStrategy:', address(discountRateStrategy));
     console2.log('AMOMinter:', address(amoMinter));
     console2.log('========================================');
-  }
-}
-
-/**
- * @title DeployTokensOnly
- * @notice Deploys only the token contracts for testing
- */
-contract DeployTokensOnly is Script {
-  function run() external {
-    address deployer = vm.envOr('DEPLOYER', msg.sender);
-    address admin = vm.envOr('ADMIN', deployer);
-
-    vm.startBroadcast(deployer);
-
-    // Deploy jUBC token
-    JUBCToken jUBCToken = new JUBCToken(admin);
-    console2.log('JUBCToken deployed at:', address(jUBCToken));
-
-    // Grant roles
-    bytes32 FACILITATOR_MANAGER_ROLE = keccak256('FACILITATOR_MANAGER_ROLE');
-    bytes32 BUCKET_MANAGER_ROLE = keccak256('BUCKET_MANAGER_ROLE');
-    jUBCToken.grantRole(FACILITATOR_MANAGER_ROLE, admin);
-    jUBCToken.grantRole(BUCKET_MANAGER_ROLE, admin);
-
-    vm.stopBroadcast();
   }
 }
 
@@ -393,8 +369,7 @@ contract ConfigureFacilitator is Script {
 
     vm.startBroadcast(deployer);
 
-    JUBCToken jUBC = JUBCToken(jUBCAddress);
-    jUBC.addFacilitator(facilitator, label, capacity);
+    IJUBCToken(jUBCAddress).addFacilitator(facilitator, label, capacity);
 
     console2.log('Facilitator added:');
     console2.log('  Address:', facilitator);
