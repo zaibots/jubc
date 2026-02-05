@@ -6,7 +6,7 @@ import {IERC20} from 'openzeppelin-contracts/contracts/token/ERC20/IERC20.sol';
 import {IPool} from '../../../src/contracts/interfaces/IPool.sol';
 import {IAaveOracle} from '../../../src/contracts/interfaces/IAaveOracle.sol';
 import {DataTypes} from '../../../src/contracts/protocol/libraries/types/DataTypes.sol';
-import {JUBCToken} from 'custom/jubc/JUBCToken.sol';
+import {MockJUBCToken} from '../lib/MockJUBCToken.sol';
 
 /**
  * @title ProtocolHandler
@@ -27,7 +27,7 @@ contract ProtocolHandler is Test {
   // ══════════════════════════════════════════════════════════════════════════════
 
   IPool public pool;
-  JUBCToken public jpyUbi;
+  MockJUBCToken public jpyUbi;
   IAaveOracle public oracle;
   address[] public collateralAssets;
   address[] public actors;
@@ -47,7 +47,7 @@ contract ProtocolHandler is Test {
 
   constructor(
     IPool _pool,
-    JUBCToken _jpyUbi,
+    MockJUBCToken _jpyUbi,
     IAaveOracle _oracle,
     address[] memory _collateralAssets,
     address[] memory _actors
