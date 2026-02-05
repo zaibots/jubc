@@ -2,6 +2,11 @@
   "name": "@aave-dao/aave-v3-origin",
   "version": "3.6.0",
   "scripts": {
+    "install:deps": "git submodule update --init --recursive && forge install --no-commit",
+    "install:all": "npm run install:deps && npm install",
+    "build": "forge build",
+    "test": "forge test",
+    "test:custom": "forge test --match-path 'tests/custom/**/*.sol'",
     "lint": "prettier . --check",
     "lint:fix": "prettier . --write",
     "changeset": "changeset",

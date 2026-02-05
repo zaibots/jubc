@@ -14,7 +14,7 @@ import {IVariableDebtToken} from '../../../src/contracts/interfaces/IVariableDeb
 import {DataTypes} from '../../../src/contracts/protocol/libraries/types/DataTypes.sol';
 import {ReserveConfiguration} from '../../../src/contracts/protocol/libraries/configuration/ReserveConfiguration.sol';
 
-import {JUBCToken} from 'custom/jubc/JUBCToken.sol';
+import {MockJUBCToken} from '../lib/MockJUBCToken.sol';
 import {JpyUbiAMOMinter} from 'custom/amo/JpyUbiAMOMinter.sol';
 import {JpyUbiConvexAMO} from 'custom/amo/JpyUbiConvexAMO.sol';
 import {DataStreamAggregatorAdapter} from 'custom/oracles/DataStreamAggregatorAdapter.sol';
@@ -174,7 +174,7 @@ abstract contract TestZaiBotsMarket is Test {
   IACLManager public aclManager;
   IAaveOracle public oracle;
 
-  JUBCToken public jpyUbi;
+  MockJUBCToken public jpyUbi;
   JpyUbiAMOMinter public amoMinter;
   JpyUbiConvexAMO public convexAMO;
   DataStreamAggregatorAdapter public jpyUsdOracle;
@@ -310,7 +310,7 @@ abstract contract TestZaiBotsMarket is Test {
 
     verifierProxy = new MockVerifierProxy();
 
-    jpyUbi = new JUBCToken(owner);
+    jpyUbi = new MockJUBCToken(owner);
 
     jpyUsdOracle = new DataStreamAggregatorAdapter(address(verifierProxy), keccak256('JPY/USD'), 8, 'JPY / USD');
 
@@ -346,7 +346,7 @@ abstract contract TestZaiBotsMarket is Test {
     }
 
     if (config.jpyUbiToken != address(0)) {
-      jpyUbi = JUBCToken(config.jpyUbiToken);
+      jpyUbi = MockJUBCToken(config.jpyUbiToken);
     }
     if (config.usdc != address(0)) usdc = MockERC20(config.usdc);
     if (config.usdt != address(0)) usdt = IERC20(config.usdt);
@@ -533,7 +533,7 @@ abstract contract TestZaiBotsMarket is Test {
   }
 
   function _isFacilitator(address account) internal view virtual returns (bool) {
-    JUBCToken.Facilitator memory f = jpyUbi.getFacilitator(account);
+    MockJUBCToken.Facilitator memory f = jpyUbi.getFacilitator(account);
     return bytes(f.label).length > 0;
   }
 
