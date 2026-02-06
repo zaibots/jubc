@@ -28,6 +28,7 @@ contract CarryStrategy is Ownable, ReentrancyGuard {
     address collateralToken;
     address debtToken;
     address jpyUsdOracle;
+    address jpyUsdAggregator;
     address twapOracle;
     address milkman;
     address priceChecker;
@@ -281,7 +282,7 @@ contract CarryStrategy is Ownable, ReentrancyGuard {
   function _getDebtBalanceInBase() internal view returns (uint256) {
     uint256 debtBalance = _getDebtBalance();
     if (debtBalance == 0) return 0;
-    (, int256 price, , , ) = IChainlinkAggregatorV3(addr.jpyUsdOracle).latestRoundData();
+    (, int256 price, , , ) = IChainlinkAggregatorV3(addr.jpyUsdOracle ?? addr.jpyUsdAggregator).latestRoundData();
     return (debtBalance * uint256(price)) / 1e20;
   }
 
@@ -298,7 +299,7 @@ contract CarryStrategy is Ownable, ReentrancyGuard {
   }
 
   function _calculateDebtBorrowAmount(uint256 baseAmount) internal view returns (uint256) {
-    (, int256 price, , , ) = IChainlinkAggregatorV3(addr.jpyUsdOracle).latestRoundData();
+    (, int256 price, , , ) = IChainlinkAggregatorV3(addr.jpyUsdOracle ?? addr.jpyUsdAggregator).latestRoundData();
     uint256 jpyAmount = (baseAmount * 1e20) / uint256(price);
     uint256 ltv = _getLTV();
     return (jpyAmount * ltv) / FULL_PRECISION;

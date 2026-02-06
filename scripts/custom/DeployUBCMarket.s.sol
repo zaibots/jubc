@@ -31,6 +31,7 @@ contract DeployUBCMarket is Script {
   // Chainlink Data Streams
   address public verifierProxy;
   bytes32 public jpyUsdFeedId;
+  address public jpyUsdAggregatorFeed;
 
   function setUp() public {
     deployer = vm.envOr('DEPLOYER', msg.sender);
@@ -38,7 +39,9 @@ contract DeployUBCMarket is Script {
     treasury = vm.envOr('TREASURY', deployer);
 
     // Default verifier proxy (Mainnet)
-    verifierProxy = vm.envOr('VERIFIER_PROXY', address(0x2ff010DEbC1297f19579B4246cad07bd24F2488A));
+    verifierProxy = vm.envOr('VERIFIER_PROXY');
+    // Default aggregator oracle (Sepolia) 
+    jpyUsdAggregatorFeed = vm.envOr('AGGREGATOR_FEED', address(0xB0C712f98daE15264c8E26132BCC91C40aD4d5F9));
     jpyUsdFeedId = vm.envOr('JPY_USD_FEED_ID', keccak256('JPY/USD'));
   }
 
@@ -103,7 +106,7 @@ contract DeployUBCMarket is Script {
     jUBCToken.grantRole(BUCKET_MANAGER_ROLE, admin);
 
     // Authorize keeper for oracle
-    jpyUsdOracle.setKeeperAuthorization(admin, true);
+    if(verifierProxy) jpyUsdOracle.setKeeperAuthorization(admin, true);
 
     console2.log('Roles configured');
   }
