@@ -170,8 +170,7 @@ contract CarryHandler is Test {
         if (strategy.twapLeverageRatio() == 0) return;
         if (strategy.swapState() != CarryStrategy.SwapState.IDLE) return;
 
-        // Note: iterateRebalance doesn't exist in current CarryStrategy, using rebalance instead
-        try strategy.rebalance() {
+        try strategy.iterateRebalance() {
             if (strategy.swapState() == CarryStrategy.SwapState.PENDING_LEVER_SWAP) {
                 ghost_leverSwaps++;
             } else if (strategy.swapState() == CarryStrategy.SwapState.PENDING_DELEVER_SWAP) {
@@ -201,10 +200,11 @@ contract CarryHandler is Test {
 
         if (strategy.swapState() != CarryStrategy.SwapState.PENDING_LEVER_SWAP) return;
 
-        // Settle the swap in mock milkman - tokens flow back automatically
         bytes32 swapId = milkman.getLatestSwapId();
         milkman.settleSwapWithPrice(swapId);
-        // Note: strategy handles swap completion via Milkman callback
+        vm.stopPrank();
+        try strategy.completeSwap() {} catch {}
+        vm.startPrank(currentActor, currentActor);
     }
 
     function completeDeleverSwap(uint256 actorSeed) external useActor(actorSeed) {
@@ -214,13 +214,29 @@ contract CarryHandler is Test {
 
         bytes32 swapId = milkman.getLatestSwapId();
         milkman.settleSwapWithPrice(swapId);
-        // Note: strategy handles swap completion via Milkman callback
+        vm.stopPrank();
+        try strategy.completeSwap() {} catch {}
+        vm.startPrank(currentActor, currentActor);
     }
 
-    function cancelTimedOutSwap() external {
+    function cancelTimedOutSwap(uint256 actorSeed) external useActor(actorSeed) {
         calls[this.cancelTimedOutSwap.selector]++;
-        // Note: cancelTimedOutSwap not implemented in current CarryStrategy
-        // This is a no-op placeholder
+
+        if (strategy.swapState() == CarryStrategy.SwapState.IDLE) return;
+        if (block.timestamp < strategy.pendingSwapTs() + strategy.SWAP_TIMEOUT()) return;
+
+        try strategy.cancelTimedOutSwap() {
+            ghost_cancelledSwaps++;
+        } catch {}
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // LTV SYNC
+    // ═══════════════════════════════════════════════════════════════════
+
+    function syncLTV() external {
+        calls[this.syncLTV.selector]++;
+        try strategy.syncLTV() {} catch {}
     }
 
     // ═══════════════════════════════════════════════════════════════════
@@ -280,6 +296,7 @@ contract CarryHandler is Test {
         console2.log("  warpTime:", calls[this.warpTime.selector]);
         console2.log("  warpBlocks:", calls[this.warpBlocks.selector]);
         console2.log("  updateTwap:", calls[this.updateTwap.selector]);
+        console2.log("  syncLTV:", calls[this.syncLTV.selector]);
         console2.log("");
         console2.log("Ghost Variables:");
         console2.log("  totalDeposited:", ghost_totalDeposited);

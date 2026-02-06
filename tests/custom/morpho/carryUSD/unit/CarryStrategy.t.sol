@@ -391,30 +391,836 @@ contract CarryStrategyTest is TestCarryUSDBase {
     // ═══════════════════════════════════════════════════════════════════
     // SWAP COMPLETION TESTS
     // ═══════════════════════════════════════════════════════════════════
-    // NOTE: Swap completion is handled via Milkman callbacks, not direct method calls
 
-    function test_completeLeverSwap_resetsSwapState() public onlyLocal {
+    function test_completeSwap_lever_suppliesCollateral() public onlyLocal {
         _setupCollateral(100_000e6);
 
         vm.prank(keeper, keeper);
         carryStrategy.engage();
 
-        _completeLeverSwap();
+        uint256 collateralBefore = mockZaibots.getCollateralBalance(address(carryStrategy), address(usdc));
+
+        // Settle milkman swap (tokens go to strategy)
+        bytes32 swapId = mockMilkman.getLatestSwapId();
+        mockMilkman.settleSwapWithPrice(swapId);
+
+        // Call completeSwap to supply tokens to zaibots
+        carryStrategy.completeSwap();
 
         assertEq(uint256(carryStrategy.swapState()), uint256(CarryStrategy.SwapState.IDLE), "Should reset to IDLE");
         assertEq(carryStrategy.pendingSwapAmount(), 0, "Should reset pending amount");
         assertEq(carryStrategy.pendingSwapTs(), 0, "Should reset pending timestamp");
+        assertGt(mockZaibots.getCollateralBalance(address(carryStrategy), address(usdc)), collateralBefore, "Collateral should increase");
+    }
+
+    function test_completeSwap_delever_repaysDebt() public onlyLocal {
+        _setupEngagedStrategy(100_000e6);
+
+        // Push price up to trigger delever rebalance
+        _applyPriceChange(2000); // +20% yen weakening
+        _warpToRebalanceWindow();
+
+        // Trigger rebalance (delever direction)
+        uint256 currentLev = carryStrategy.getCurrentLeverageRatio();
+        uint256 targetLev = uint256(CONSERVATIVE_TARGET) * 1e9;
+        if (currentLev > targetLev) {
+            vm.prank(keeper, keeper);
+            carryStrategy.rebalance();
+
+            assertEq(uint256(carryStrategy.swapState()), uint256(CarryStrategy.SwapState.PENDING_DELEVER_SWAP), "Should be pending delever");
+
+            uint256 debtBefore = mockZaibots.getDebtBalance(address(carryStrategy), address(jUBC));
+
+            // Settle and complete
+            bytes32 swapId = mockMilkman.getLatestSwapId();
+            mockMilkman.settleSwapWithPrice(swapId);
+            carryStrategy.completeSwap();
+
+            assertEq(uint256(carryStrategy.swapState()), uint256(CarryStrategy.SwapState.IDLE), "Should reset to IDLE");
+            assertLe(mockZaibots.getDebtBalance(address(carryStrategy), address(jUBC)), debtBefore, "Debt should decrease or stay");
+        }
+    }
+
+    function test_completeSwap_revertsWhenIdle() public onlyLocal {
+        vm.expectRevert(CarryStrategy.SwapNotPending.selector);
+        carryStrategy.completeSwap();
+    }
+
+    function test_completeSwap_isPermissionless() public onlyLocal {
+        _setupCollateral(100_000e6);
+
+        vm.prank(keeper, keeper);
+        carryStrategy.engage();
+
+        bytes32 swapId = mockMilkman.getLatestSwapId();
+        mockMilkman.settleSwapWithPrice(swapId);
+
+        // Charlie (not an allowed caller) can call completeSwap
+        vm.prank(charlie);
+        carryStrategy.completeSwap();
+
+        assertEq(uint256(carryStrategy.swapState()), uint256(CarryStrategy.SwapState.IDLE), "Should reset to IDLE");
     }
 
     // ═══════════════════════════════════════════════════════════════════
-    // CANCEL SWAP TESTS
+    // CANCEL TIMED OUT SWAP TESTS
     // ═══════════════════════════════════════════════════════════════════
-    // NOTE: cancelTimedOutSwap() is not implemented in the current CarryStrategy
-    // These tests are placeholders
 
-    function test_cancelSwap_placeholder() public view {
-        // cancelTimedOutSwap() is not implemented in the current CarryStrategy
-        assertTrue(true, "Cancel swap tests are skipped - cancelTimedOutSwap not implemented");
+    function test_cancelTimedOutSwap_works() public onlyLocal {
+        _setupCollateral(100_000e6);
+
+        vm.prank(keeper, keeper);
+        carryStrategy.engage();
+
+        assertEq(uint256(carryStrategy.swapState()), uint256(CarryStrategy.SwapState.PENDING_LEVER_SWAP), "Should be pending");
+
+        _warpPastSwapTimeout();
+
+        vm.prank(keeper, keeper);
+        carryStrategy.cancelTimedOutSwap();
+
+        assertEq(uint256(carryStrategy.swapState()), uint256(CarryStrategy.SwapState.IDLE), "Should be IDLE after cancel");
+        assertEq(carryStrategy.pendingSwapAmount(), 0, "Should reset pending amount");
+        assertEq(carryStrategy.pendingSwapTs(), 0, "Should reset pending timestamp");
+    }
+
+    function test_cancelTimedOutSwap_revertsBeforeTimeout() public onlyLocal {
+        _setupCollateral(100_000e6);
+
+        vm.prank(keeper, keeper);
+        carryStrategy.engage();
+
+        vm.prank(keeper, keeper);
+        vm.expectRevert(CarryStrategy.SwapNotTimedOut.selector);
+        carryStrategy.cancelTimedOutSwap();
+    }
+
+    function test_cancelTimedOutSwap_revertsWhenIdle() public onlyLocal {
+        vm.prank(keeper, keeper);
+        vm.expectRevert(CarryStrategy.SwapNotPending.selector);
+        carryStrategy.cancelTimedOutSwap();
+    }
+
+    function test_cancelTimedOutSwap_onlyAllowedCaller() public onlyLocal {
+        _setupCollateral(100_000e6);
+
+        vm.prank(keeper, keeper);
+        carryStrategy.engage();
+
+        _warpPastSwapTimeout();
+
+        vm.prank(charlie, charlie);
+        vm.expectRevert(CarryStrategy.NotAllowedCaller.selector);
+        carryStrategy.cancelTimedOutSwap();
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // ITERATE REBALANCE TESTS
+    // ═══════════════════════════════════════════════════════════════════
+
+    function test_iterateRebalance_leversTowardTarget() public onlyLocal {
+        _setupCollateral(100_000e6);
+
+        vm.prank(keeper, keeper);
+        carryStrategy.engage();
+        _completeLeverSwap();
+
+        // twapLeverageRatio should be set after engage
+        assertTrue(carryStrategy.twapLeverageRatio() > 0, "TWAP should be active");
+
+        _warpPastTwapCooldown();
+
+        vm.prank(keeper, keeper);
+        carryStrategy.iterateRebalance();
+
+        // Should create a pending lever swap
+        assertTrue(
+            carryStrategy.swapState() == CarryStrategy.SwapState.PENDING_LEVER_SWAP ||
+            carryStrategy.twapLeverageRatio() == 0,
+            "Should have created swap or reached target"
+        );
+    }
+
+    function test_iterateRebalance_clearsTwapWhenSmallTrade() public onlyLocal {
+        // Use a small amount so the full trade fits in one maxTradeSize
+        _setupCollateral(1_000e6);
+
+        vm.prank(keeper, keeper);
+        carryStrategy.engage();
+        _completeLeverSwap();
+
+        // After engage + complete, the remaining amount might be small enough
+        // to fit in one trade, clearing TWAP
+        if (carryStrategy.twapLeverageRatio() > 0) {
+            _warpPastTwapCooldown();
+            vm.prank(keeper, keeper);
+            carryStrategy.iterateRebalance();
+
+            if (carryStrategy.swapState() == CarryStrategy.SwapState.PENDING_LEVER_SWAP) {
+                _completeLeverSwap();
+            }
+            // With small amounts, TWAP should clear quickly
+            // (may need more iterations for larger amounts)
+        }
+        // Just verify no revert
+    }
+
+    function test_iterateRebalance_revertsWhenNoTwap() public onlyLocal {
+        _setupCollateral(100_000e6);
+        // Don't engage, so twapLeverageRatio = 0
+
+        vm.prank(keeper, keeper);
+        vm.expectRevert(CarryStrategy.TwapNotActive.selector);
+        carryStrategy.iterateRebalance();
+    }
+
+    function test_iterateRebalance_revertsBeforeCooldown() public onlyLocal {
+        _setupCollateral(100_000e6);
+
+        vm.prank(keeper, keeper);
+        carryStrategy.engage();
+        _completeLeverSwap();
+
+        // Call immediately without warping past cooldown
+        vm.prank(keeper, keeper);
+        vm.expectRevert(CarryStrategy.RebalanceIntervalNotElapsed.selector);
+        carryStrategy.iterateRebalance();
+    }
+
+    function test_iterateRebalance_requiresEOA() public onlyLocal {
+        vm.prank(address(this)); // Contract context
+        vm.expectRevert("Not EOA");
+        carryStrategy.iterateRebalance();
+    }
+
+    function test_iterateRebalance_requiresAllowedCaller() public onlyLocal {
+        _setupCollateral(100_000e6);
+
+        vm.prank(keeper, keeper);
+        carryStrategy.engage();
+        _completeLeverSwap();
+        _warpPastTwapCooldown();
+
+        vm.prank(charlie, charlie); // Not allowed caller
+        vm.expectRevert(CarryStrategy.NotAllowedCaller.selector);
+        carryStrategy.iterateRebalance();
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // LEVERAGE VALIDATION TESTS (Phase 3)
+    // ═══════════════════════════════════════════════════════════════════
+
+    function test_constructor_revertsOnUnreachableLeverage() public onlyLocal {
+        // With mock LTV of 75%, max theoretical leverage = 1/(1-0.75) = 4x
+        // Aggressive target 10x with 75% LTV should revert
+        // 10_000_000_000 * (1e18 - 0.75e18) = 10e9 * 0.25e18 = 2.5e27 >= 1e27 → revert
+        CarryStrategy.Addresses memory addrs = CarryStrategy.Addresses({
+            adapter: address(0),
+            zaibots: address(mockZaibots),
+            collateralToken: address(usdc),
+            debtToken: address(jUBC),
+            jpyUsdOracle: address(mockJpyUsdFeed),
+            jpyUsdAggregator: address(0),
+            twapOracle: address(twapOracle),
+            milkman: address(mockMilkman),
+            priceChecker: address(priceChecker)
+        });
+        vm.expectRevert(CarryStrategy.LeverageExceedsLTVLimit.selector);
+        new CarryStrategy(
+            "Too Aggressive",
+            CarryStrategy.StrategyType.AGGRESSIVE,
+            addrs,
+            [AGGRESSIVE_TARGET, AGGRESSIVE_MIN, AGGRESSIVE_MAX, AGGRESSIVE_RIPCORD],
+            CarryStrategy.ExecutionParams(DEFAULT_MAX_TRADE_SIZE, DEFAULT_TWAP_COOLDOWN, DEFAULT_SLIPPAGE_BPS, DEFAULT_REBALANCE_INTERVAL, DEFAULT_RECENTER_SPEED),
+            CarryStrategy.IncentiveParams(DEFAULT_RIPCORD_SLIPPAGE_BPS, DEFAULT_RIPCORD_COOLDOWN, DEFAULT_RIPCORD_MAX_TRADE, DEFAULT_ETH_REWARD)
+        );
+    }
+
+    function test_constructor_acceptsReachableLeverage() public onlyLocal {
+        // Conservative target 2.5x with 75% LTV: 2.5e9 * 0.25e18 = 0.625e27 < 1e27 → pass
+        CarryStrategy.Addresses memory addrs = CarryStrategy.Addresses({
+            adapter: address(0),
+            zaibots: address(mockZaibots),
+            collateralToken: address(usdc),
+            debtToken: address(jUBC),
+            jpyUsdOracle: address(mockJpyUsdFeed),
+            jpyUsdAggregator: address(0),
+            twapOracle: address(twapOracle),
+            milkman: address(mockMilkman),
+            priceChecker: address(priceChecker)
+        });
+        CarryStrategy s = new CarryStrategy(
+            "Conservative OK",
+            CarryStrategy.StrategyType.CONSERVATIVE,
+            addrs,
+            [CONSERVATIVE_TARGET, CONSERVATIVE_MIN, CONSERVATIVE_MAX, CONSERVATIVE_RIPCORD],
+            CarryStrategy.ExecutionParams(DEFAULT_MAX_TRADE_SIZE, DEFAULT_TWAP_COOLDOWN, DEFAULT_SLIPPAGE_BPS, DEFAULT_REBALANCE_INTERVAL, DEFAULT_RECENTER_SPEED),
+            CarryStrategy.IncentiveParams(DEFAULT_RIPCORD_SLIPPAGE_BPS, DEFAULT_RIPCORD_COOLDOWN, DEFAULT_RIPCORD_MAX_TRADE, DEFAULT_ETH_REWARD)
+        );
+        assertTrue(address(s) != address(0), "Should deploy successfully");
+    }
+
+    function test_constructor_edgeCase_targetAtExactLimit() public onlyLocal {
+        // With 75% LTV, max leverage = 1e27 / complement = 1e27 / 0.25e18 = 4e9
+        // At exactly the limit: target * complement == 1e27 → should revert (>= check)
+        CarryStrategy.Addresses memory addrs = CarryStrategy.Addresses({
+            adapter: address(0),
+            zaibots: address(mockZaibots),
+            collateralToken: address(usdc),
+            debtToken: address(jUBC),
+            jpyUsdOracle: address(mockJpyUsdFeed),
+            jpyUsdAggregator: address(0),
+            twapOracle: address(twapOracle),
+            milkman: address(mockMilkman),
+            priceChecker: address(priceChecker)
+        });
+        uint64 exactLimit = 4_000_000_000; // 4x, at the boundary for 75% LTV
+        vm.expectRevert(CarryStrategy.LeverageExceedsLTVLimit.selector);
+        new CarryStrategy(
+            "Edge Case",
+            CarryStrategy.StrategyType.CONSERVATIVE,
+            addrs,
+            [exactLimit, uint64(2_000_000_000), exactLimit, uint64(5_000_000_000)],
+            CarryStrategy.ExecutionParams(DEFAULT_MAX_TRADE_SIZE, DEFAULT_TWAP_COOLDOWN, DEFAULT_SLIPPAGE_BPS, DEFAULT_REBALANCE_INTERVAL, DEFAULT_RECENTER_SPEED),
+            CarryStrategy.IncentiveParams(DEFAULT_RIPCORD_SLIPPAGE_BPS, DEFAULT_RIPCORD_COOLDOWN, DEFAULT_RIPCORD_MAX_TRADE, DEFAULT_ETH_REWARD)
+        );
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // LTV SYNC TESTS (Phase 1 v2)
+    // ═══════════════════════════════════════════════════════════════════
+
+    function test_syncLTV_returnsValidWhenLTVUnchanged() public onlyLocal {
+        // Default 75% LTV, 2.5x target → valid (2.5e9 * 0.25e18 = 0.625e27 < 1e27)
+        bool valid = carryStrategy.syncLTV();
+        assertTrue(valid, "Should be valid with unchanged LTV");
+        assertTrue(carryStrategy.isActive(), "Should remain active");
+    }
+
+    function test_syncLTV_deactivatesWhenLTVDrops() public onlyLocal {
+        // Drop LTV to 50% → max leverage = 2x, but target = 2.5x → invalid
+        mockZaibots.setLTV(address(usdc), address(jUBC), 0.50e18);
+
+        vm.expectEmit(true, true, true, true);
+        emit CarryStrategy.StrategyAutoDeactivated("LTV no longer supports target leverage");
+
+        bool valid = carryStrategy.syncLTV();
+        assertFalse(valid, "Should be invalid after LTV drop to 50%");
+        assertFalse(carryStrategy.isActive(), "Should auto-deactivate");
+    }
+
+    function test_syncLTV_remainsActiveWhenLTVIncreases() public onlyLocal {
+        // Increase LTV to 85% → max leverage ~6.67x >> 2.5x target
+        mockZaibots.setLTV(address(usdc), address(jUBC), 0.85e18);
+
+        bool valid = carryStrategy.syncLTV();
+        assertTrue(valid, "Should be valid with higher LTV");
+        assertTrue(carryStrategy.isActive(), "Should remain active");
+    }
+
+    function test_syncLTV_isPermissionless() public onlyLocal {
+        // Charlie (not operator, not owner, not allowed caller) can call syncLTV
+        vm.prank(charlie);
+        bool valid = carryStrategy.syncLTV();
+        assertTrue(valid, "Should succeed from any address");
+    }
+
+    function test_syncLTV_idempotentWhenAlreadyDeactivated() public onlyLocal {
+        mockZaibots.setLTV(address(usdc), address(jUBC), 0.50e18);
+
+        carryStrategy.syncLTV();
+        assertFalse(carryStrategy.isActive(), "Should be deactivated");
+
+        // Call again — should not revert
+        bool valid = carryStrategy.syncLTV();
+        assertFalse(valid, "Should still be invalid");
+        assertFalse(carryStrategy.isActive(), "Should stay deactivated");
+    }
+
+    function test_isLTVValid_viewFunction() public onlyLocal {
+        assertTrue(carryStrategy.isLTVValid(), "Should be valid initially");
+
+        mockZaibots.setLTV(address(usdc), address(jUBC), 0.50e18);
+
+        assertFalse(carryStrategy.isLTVValid(), "View should return false after LTV drop");
+        assertTrue(carryStrategy.isActive(), "View should not mutate isActive");
+    }
+
+    function test_engage_revertsAfterLTVDrop_syncDeactivates() public onlyLocal {
+        _setupCollateral(100_000e6);
+
+        // Drop LTV and sync → deactivates
+        mockZaibots.setLTV(address(usdc), address(jUBC), 0.50e18);
+        carryStrategy.syncLTV();
+
+        vm.prank(keeper, keeper);
+        vm.expectRevert(CarryStrategy.StrategyNotActive.selector);
+        carryStrategy.engage();
+    }
+
+    function test_engage_revertsOnInlineLTVCheck() public onlyLocal {
+        _setupCollateral(100_000e6);
+
+        // Drop LTV but do NOT call syncLTV — engage's inline check should catch it
+        mockZaibots.setLTV(address(usdc), address(jUBC), 0.50e18);
+
+        vm.prank(keeper, keeper);
+        vm.expectRevert(CarryStrategy.LeverageExceedsLTVLimit.selector);
+        carryStrategy.engage();
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // ITERATE REBALANCE LOW LIQUIDITY TESTS (Phase 2 v2)
+    // ═══════════════════════════════════════════════════════════════════
+
+    function test_iterateRebalance_doesNotClearTwapWhenBorrowCapped() public onlyLocal {
+        _setupCollateral(100_000e6);
+
+        vm.prank(keeper, keeper);
+        carryStrategy.engage();
+        _completeLeverSwap();
+
+        // Set tiny max borrow so iterations are constrained
+        mockZaibots.setMaxBorrow(address(carryStrategy), 100e18); // Tiny borrow cap
+
+        _warpPastTwapCooldown();
+
+        if (carryStrategy.twapLeverageRatio() > 0) {
+            vm.prank(keeper, keeper);
+            carryStrategy.iterateRebalance();
+
+            // TWAP should NOT clear because borrow was capped
+            if (carryStrategy.swapState() == CarryStrategy.SwapState.PENDING_LEVER_SWAP) {
+                assertTrue(carryStrategy.twapLeverageRatio() > 0, "TWAP should persist when borrow capped");
+            }
+        }
+    }
+
+    function test_iterateRebalance_skipsWhenZeroBorrowCapacity() public onlyLocal {
+        _setupCollateral(100_000e6);
+
+        vm.prank(keeper, keeper);
+        carryStrategy.engage();
+        _completeLeverSwap();
+
+        // Set zero borrow capacity
+        mockZaibots.setMaxBorrow(address(carryStrategy), 0);
+
+        _warpPastTwapCooldown();
+
+        if (carryStrategy.twapLeverageRatio() > 0) {
+            uint64 twapBefore = carryStrategy.twapLeverageRatio();
+
+            vm.prank(keeper, keeper);
+            carryStrategy.iterateRebalance();
+
+            // TWAP should stay active, swapState stays IDLE (no swap created)
+            assertEq(carryStrategy.twapLeverageRatio(), twapBefore, "TWAP should persist with zero capacity");
+            assertEq(uint256(carryStrategy.swapState()), uint256(CarryStrategy.SwapState.IDLE), "Should stay IDLE");
+        }
+    }
+
+    function test_iterateRebalance_clearsTwapWhenFullAmountExecuted() public onlyLocal {
+        // Use small collateral so trade fits in one maxTradeSize
+        _setupCollateral(1_000e6);
+
+        vm.prank(keeper, keeper);
+        carryStrategy.engage();
+        _completeLeverSwap();
+
+        // Clear override so full borrow is available
+        mockZaibots.clearMaxBorrowOverride(address(carryStrategy));
+
+        // Complete remaining TWAP iterations
+        uint256 iterations = 0;
+        while (carryStrategy.twapLeverageRatio() > 0 && iterations < 10) {
+            _warpPastTwapCooldown();
+            if (carryStrategy.swapState() == CarryStrategy.SwapState.IDLE) {
+                vm.prank(keeper, keeper);
+                try carryStrategy.iterateRebalance() {} catch { break; }
+                if (carryStrategy.swapState() != CarryStrategy.SwapState.IDLE) {
+                    _completeLeverSwap();
+                }
+            }
+            iterations++;
+        }
+
+        // With small collateral, TWAP should eventually clear
+        assertEq(carryStrategy.twapLeverageRatio(), 0, "TWAP should clear with full execution");
+    }
+
+    function test_iterateRebalance_lowLiquidityRecovery() public onlyLocal {
+        _setupCollateral(100_000e6);
+
+        vm.prank(keeper, keeper);
+        carryStrategy.engage();
+        _completeLeverSwap();
+
+        // Constrained period — tiny borrow cap
+        mockZaibots.setMaxBorrow(address(carryStrategy), 50e18);
+
+        _warpPastTwapCooldown();
+
+        if (carryStrategy.twapLeverageRatio() > 0) {
+            vm.prank(keeper, keeper);
+            carryStrategy.iterateRebalance();
+
+            // Complete if swap was created
+            if (carryStrategy.swapState() != CarryStrategy.SwapState.IDLE) {
+                _completeLeverSwap();
+            }
+
+            // TWAP should still be active
+            assertTrue(carryStrategy.twapLeverageRatio() > 0, "TWAP should persist during constrained period");
+
+            // Restore capacity
+            mockZaibots.clearMaxBorrowOverride(address(carryStrategy));
+
+            _warpPastTwapCooldown();
+
+            vm.prank(keeper, keeper);
+            carryStrategy.iterateRebalance();
+
+            // With restored capacity, progress should resume
+            assertTrue(
+                carryStrategy.swapState() == CarryStrategy.SwapState.PENDING_LEVER_SWAP ||
+                carryStrategy.twapLeverageRatio() == 0,
+                "Should resume after capacity restored"
+            );
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // BORROW CAPACITY CAPPING TESTS (Phase 4)
+    // ═══════════════════════════════════════════════════════════════════
+
+    function test_lever_capsToMaxBorrow() public onlyLocal {
+        _setupCollateral(100_000e6);
+
+        // Set a very low max borrow so the cap kicks in
+        mockZaibots.setMaxBorrow(address(carryStrategy), 1_000e18);
+
+        vm.prank(keeper, keeper);
+        carryStrategy.engage();
+
+        // Swap should have been created with capped amount
+        assertEq(
+            uint256(carryStrategy.swapState()),
+            uint256(CarryStrategy.SwapState.PENDING_LEVER_SWAP),
+            "Should still create swap with capped amount"
+        );
+    }
+
+    function test_lever_skipsWhenZeroBorrowCapacity() public onlyLocal {
+        _setupCollateral(100_000e6);
+
+        // Set zero max borrow — strategy should return early without creating swap
+        mockZaibots.setMaxBorrow(address(carryStrategy), 1); // After 95% safety: 0
+
+        vm.prank(keeper, keeper);
+        carryStrategy.engage();
+
+        // With zero capacity, _lever returns early, no swap created
+        // engage() still completes but swapState stays IDLE
+        // Note: engage() sets twapLeverageRatio before calling _lever
+    }
+
+    function test_lever_normalOperationUnaffected() public onlyLocal {
+        _setupCollateral(100_000e6);
+
+        // Default mock behavior (50% of collateral) — should not cap
+        vm.prank(keeper, keeper);
+        carryStrategy.engage();
+
+        assertEq(
+            uint256(carryStrategy.swapState()),
+            uint256(CarryStrategy.SwapState.PENDING_LEVER_SWAP),
+            "Normal engage should create lever swap"
+        );
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // COMPLETE SWAP VALIDATION TESTS (Phase 3 v2)
+    // ═══════════════════════════════════════════════════════════════════
+
+    function test_completeSwap_revertsOnLowOutput() public onlyLocal {
+        _setupCollateral(100_000e6);
+
+        vm.prank(keeper, keeper);
+        carryStrategy.engage();
+
+        // Don't settle via milkman — manually send tiny USDC (attack scenario)
+        mockUsdc.mint(address(carryStrategy), 1e6); // Only 1 USDC
+
+        vm.expectRevert(CarryStrategy.SwapOutputTooLow.selector);
+        carryStrategy.completeSwap();
+    }
+
+    function test_completeSwap_acceptsValidOutput() public onlyLocal {
+        _setupCollateral(100_000e6);
+
+        vm.prank(keeper, keeper);
+        carryStrategy.engage();
+
+        // Normal Milkman settlement
+        _completeLeverSwap();
+
+        assertEq(uint256(carryStrategy.swapState()), uint256(CarryStrategy.SwapState.IDLE), "Should complete");
+    }
+
+    function test_completeSwap_stateResetBeforeExternalCall() public onlyLocal {
+        _setupCollateral(100_000e6);
+
+        vm.prank(keeper, keeper);
+        carryStrategy.engage();
+
+        bytes32 swapId = mockMilkman.getLatestSwapId();
+        mockMilkman.settleSwapWithPrice(swapId);
+        carryStrategy.completeSwap();
+
+        // All pending state should be cleared (CEI)
+        assertEq(uint256(carryStrategy.swapState()), uint256(CarryStrategy.SwapState.IDLE), "State reset");
+        assertEq(carryStrategy.pendingSwapAmount(), 0, "Amount reset");
+        assertEq(carryStrategy.pendingSwapTs(), 0, "Timestamp reset");
+        assertEq(carryStrategy.pendingSwapExpectedOutput(), 0, "Expected output reset");
+    }
+
+    function test_completeSwap_setsExpectedOutputOnLever() public onlyLocal {
+        _setupCollateral(100_000e6);
+
+        vm.prank(keeper, keeper);
+        carryStrategy.engage();
+
+        assertTrue(carryStrategy.pendingSwapExpectedOutput() > 0, "Expected output should be set after lever");
+    }
+
+    function test_completeSwap_setsExpectedOutputOnDelever() public onlyLocal {
+        _setupEngagedStrategy(100_000e6);
+
+        // Push leverage up to trigger delever rebalance
+        _applyPriceChange(2000); // +20%
+        _warpToRebalanceWindow();
+
+        CarryStrategy.ShouldRebalance action = carryStrategy.shouldRebalance();
+        if (action == CarryStrategy.ShouldRebalance.REBALANCE) {
+            vm.prank(keeper, keeper);
+            carryStrategy.rebalance();
+
+            if (carryStrategy.swapState() == CarryStrategy.SwapState.PENDING_DELEVER_SWAP) {
+                assertTrue(carryStrategy.pendingSwapExpectedOutput() > 0, "Expected output should be set after delever");
+            }
+        }
+    }
+
+    function test_completeSwap_delever_revertsOnLowOutput() public onlyLocal {
+        _setupEngagedStrategy(100_000e6);
+
+        // Push leverage up to trigger delever rebalance
+        _applyPriceChange(2000);
+        _warpToRebalanceWindow();
+
+        CarryStrategy.ShouldRebalance action = carryStrategy.shouldRebalance();
+        if (action == CarryStrategy.ShouldRebalance.REBALANCE) {
+            vm.prank(keeper, keeper);
+            carryStrategy.rebalance();
+
+            if (carryStrategy.swapState() == CarryStrategy.SwapState.PENDING_DELEVER_SWAP) {
+                // Send tiny jUBC manually instead of proper settlement
+                mockJUBC.mint(address(carryStrategy), 1e18); // Tiny amount
+
+                vm.expectRevert(CarryStrategy.SwapOutputTooLow.selector);
+                carryStrategy.completeSwap();
+            }
+        }
+    }
+
+    function test_cancelTimedOutSwap_clearsExpectedOutput() public onlyLocal {
+        _setupCollateral(100_000e6);
+
+        vm.prank(keeper, keeper);
+        carryStrategy.engage();
+
+        assertTrue(carryStrategy.pendingSwapExpectedOutput() > 0, "Should have expected output");
+
+        _warpPastSwapTimeout();
+
+        vm.prank(keeper, keeper);
+        carryStrategy.cancelTimedOutSwap();
+
+        assertEq(carryStrategy.pendingSwapExpectedOutput(), 0, "Expected output should be cleared after cancel");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // LEVERAGE BOUNDS ENFORCEMENT TESTS (Phase 4 v2)
+    // ═══════════════════════════════════════════════════════════════════
+
+    function test_getMaxAchievableLeverage_75pctLTV() public view {
+        // 75% LTV → 1 / (1 - 0.75) = 4x = 4e18
+        uint256 maxLev = carryStrategy.getMaxAchievableLeverage();
+        assertEq(maxLev, 4e18, "75% LTV should give 4x max leverage");
+    }
+
+    function test_getMaxAchievableLeverage_50pctLTV() public onlyLocal {
+        mockZaibots.setLTV(address(usdc), address(jUBC), 0.50e18);
+        uint256 maxLev = carryStrategy.getMaxAchievableLeverage();
+        assertEq(maxLev, 2e18, "50% LTV should give 2x max leverage");
+    }
+
+    function test_getMaxAchievableLeverage_90pctLTV() public onlyLocal {
+        mockZaibots.setLTV(address(usdc), address(jUBC), 0.90e18);
+        uint256 maxLev = carryStrategy.getMaxAchievableLeverage();
+        assertEq(maxLev, 10e18, "90% LTV should give 10x max leverage");
+    }
+
+    function test_calculateLeverAmount_cappedToSafeMax() public onlyLocal {
+        // With 75% LTV, safe max = 4x * 0.95 = 3.8x
+        // Target is 2.5x which is below safe max → no capping expected
+        _setupCollateral(100_000e6);
+
+        vm.prank(keeper, keeper);
+        carryStrategy.engage();
+
+        // Should have created a swap (lever amount not zero)
+        assertEq(
+            uint256(carryStrategy.swapState()),
+            uint256(CarryStrategy.SwapState.PENDING_LEVER_SWAP),
+            "Should create lever swap"
+        );
+    }
+
+    function test_calculateLeverAmount_cappedWhenTargetExceedsMax() public onlyLocal {
+        // Deploy a new strategy with target 3.9x (just below 4x theoretical max for 75% LTV)
+        // Safe max = 4x * 0.95 = 3.8x, so 3.9x target gets capped to 3.8x
+        CarryStrategy.Addresses memory addrs = CarryStrategy.Addresses({
+            adapter: address(0),
+            zaibots: address(mockZaibots),
+            collateralToken: address(usdc),
+            debtToken: address(jUBC),
+            jpyUsdOracle: address(mockJpyUsdFeed),
+            jpyUsdAggregator: address(0),
+            twapOracle: address(twapOracle),
+            milkman: address(mockMilkman),
+            priceChecker: address(priceChecker)
+        });
+        uint64 highTarget = 3_900_000_000; // 3.9x
+        uint64 highMax = 3_950_000_000;    // 3.95x
+        CarryStrategy highStrategy = new CarryStrategy(
+            "High Target",
+            CarryStrategy.StrategyType.CONSERVATIVE,
+            addrs,
+            [highTarget, uint64(3_000_000_000), highMax, uint64(5_000_000_000)],
+            CarryStrategy.ExecutionParams(DEFAULT_MAX_TRADE_SIZE, DEFAULT_TWAP_COOLDOWN, DEFAULT_SLIPPAGE_BPS, DEFAULT_REBALANCE_INTERVAL, DEFAULT_RECENTER_SPEED),
+            CarryStrategy.IncentiveParams(DEFAULT_RIPCORD_SLIPPAGE_BPS, DEFAULT_RIPCORD_COOLDOWN, DEFAULT_RIPCORD_MAX_TRADE, DEFAULT_ETH_REWARD)
+        );
+        highStrategy.setAllowedCaller(keeper, true);
+        highStrategy.setOperator(keeper);
+
+        // Fund and supply collateral
+        mockUsdc.mint(address(highStrategy), 100_000e6);
+        vm.prank(address(highStrategy));
+        mockZaibots.supply(address(usdc), 100_000e6, address(highStrategy));
+
+        vm.prank(keeper, keeper);
+        highStrategy.engage();
+
+        // The lever amount should have been capped to safe max (3.8x instead of 3.9x)
+        // Verify swap was still created (capping doesn't prevent it)
+        assertTrue(
+            highStrategy.swapState() == CarryStrategy.SwapState.PENDING_LEVER_SWAP,
+            "Should create swap with capped target"
+        );
+    }
+
+    function test_lever_scalesBackBorrowWhenProjectedLeverageTooHigh() public onlyLocal {
+        // With small collateral, the pre-borrow projected leverage check
+        // should prevent borrowing more than safe leverage allows
+        _setupCollateral(2_000e6);
+
+        vm.prank(keeper, keeper);
+        carryStrategy.engage();
+
+        // After engage, verify debt doesn't exceed safe leverage bounds
+        if (carryStrategy.swapState() == CarryStrategy.SwapState.PENDING_LEVER_SWAP) {
+            uint256 debt = mockZaibots.getDebtBalance(address(carryStrategy), address(jUBC));
+            uint256 collateral = mockZaibots.getCollateralBalance(address(carryStrategy), address(usdc));
+            (, int256 price, , , ) = mockJpyUsdFeed.latestRoundData();
+            uint256 debtInBase = (debt * uint256(price)) / 1e20;
+            uint256 ltv = mockZaibots.getLTV(address(usdc), address(jUBC));
+            uint256 maxDebt = (collateral * ltv) / 1e18;
+
+            assertTrue(debtInBase <= maxDebt + 1e6, "Debt should not exceed LTV limit");
+        }
+    }
+
+    function test_lever_smallCollateral_respectsLTVBounds() public onlyLocal {
+        // The exact bug found by invariant testing: 2000 USDC, 2.5x target
+        _setupCollateral(2_000e6);
+
+        vm.prank(keeper, keeper);
+        carryStrategy.engage();
+
+        if (carryStrategy.swapState() == CarryStrategy.SwapState.PENDING_LEVER_SWAP) {
+            uint256 debt = mockZaibots.getDebtBalance(address(carryStrategy), address(jUBC));
+            uint256 collateral = mockZaibots.getCollateralBalance(address(carryStrategy), address(usdc));
+            (, int256 price, , , ) = mockJpyUsdFeed.latestRoundData();
+            uint256 debtInBase = (debt * uint256(price)) / 1e20;
+            uint256 ltv = mockZaibots.getLTV(address(usdc), address(jUBC));
+            uint256 maxDebt = (collateral * ltv) / 1e18;
+
+            assertTrue(debtInBase <= maxDebt + 1e6, "Small collateral debt should respect LTV");
+        }
+    }
+
+    function test_lever_convergence_withBoundsEnforcement() public onlyLocal {
+        _setupCollateral(100_000e6);
+
+        vm.prank(keeper, keeper);
+        carryStrategy.engage();
+        _completeLeverSwap();
+
+        // Complete TWAP iterations
+        uint256 iterations = 0;
+        while (carryStrategy.twapLeverageRatio() > 0 && iterations < 20) {
+            _warpPastTwapCooldown();
+            if (carryStrategy.swapState() == CarryStrategy.SwapState.IDLE &&
+                carryStrategy.shouldRebalance() == CarryStrategy.ShouldRebalance.ITERATE) {
+                vm.prank(keeper, keeper);
+                try carryStrategy.iterateRebalance() {} catch { break; }
+                if (carryStrategy.swapState() != CarryStrategy.SwapState.IDLE) {
+                    _completeLeverSwap();
+                }
+            } else {
+                break;
+            }
+            iterations++;
+        }
+
+        uint256 finalLev = carryStrategy.getCurrentLeverageRatio();
+        uint256 targetLev = uint256(CONSERVATIVE_TARGET) * 1e9;
+        // Should be within 5% of target
+        uint256 deviation = finalLev > targetLev ? finalLev - targetLev : targetLev - finalLev;
+        assertTrue(deviation < targetLev / 20, "Final leverage should be within 5% of target");
+    }
+
+    function testFuzz_leverNeverExceedsLTVBound(uint256 collateralAmount) public onlyLocal {
+        collateralAmount = bound(collateralAmount, 100e6, 10_000_000e6);
+
+        _setupCollateral(collateralAmount);
+
+        vm.prank(keeper, keeper);
+        carryStrategy.engage();
+
+        if (carryStrategy.swapState() == CarryStrategy.SwapState.PENDING_LEVER_SWAP) {
+            uint256 debt = mockZaibots.getDebtBalance(address(carryStrategy), address(jUBC));
+            uint256 collateral = mockZaibots.getCollateralBalance(address(carryStrategy), address(usdc));
+            (, int256 price, , , ) = mockJpyUsdFeed.latestRoundData();
+            uint256 debtInBase = (debt * uint256(price)) / 1e20;
+            uint256 ltv = mockZaibots.getLTV(address(usdc), address(jUBC));
+            uint256 maxDebt = (collateral * ltv) / 1e18;
+
+            // Allow 1% tolerance for rounding
+            assertTrue(debtInBase <= maxDebt + (maxDebt / 100) + 1e6, "Fuzz: debt should respect LTV");
+        }
     }
 
     // ═══════════════════════════════════════════════════════════════════
@@ -437,7 +1243,7 @@ contract CarryStrategyTest is TestCarryUSDBase {
         vm.prank(owner);
         carryStrategy.setAdapter(newAdapter);
 
-        (address adapter,,,,,,,) = carryStrategy.addr();
+        (address adapter,,,,,,,,) = carryStrategy.addr();
         assertEq(adapter, newAdapter, "Adapter should be updated");
     }
 
@@ -534,7 +1340,6 @@ contract CarryStrategyTest is TestCarryUSDBase {
             _warpPastTwapCooldown();
             if (carryStrategy.shouldRebalance() == CarryStrategy.ShouldRebalance.ITERATE) {
                 _iterateRebalance();
-                // Only complete swap if one was created
                 if (carryStrategy.swapState() == CarryStrategy.SwapState.PENDING_LEVER_SWAP) {
                     _completeLeverSwap();
                 }

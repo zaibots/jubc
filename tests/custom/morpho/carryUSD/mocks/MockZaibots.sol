@@ -3,6 +3,7 @@ pragma solidity ^0.8.10;
 
 import {IERC20} from "openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
 import {IZaibots} from "custom/integrations/morpho/interfaces/IZaibots.sol";
+import {IChainlinkAggregatorV3} from "custom/integrations/morpho/interfaces/IChainlinkAutomation.sol";
 
 /**
  * @title MockZaibots
@@ -199,10 +200,49 @@ contract MockZaibots is IZaibots {
         return hf < 1e18;
     }
 
+    mapping(address => uint256) public maxBorrowOverrides;
+    mapping(address => bool) public maxBorrowSet;
+
+    // Borrow pair config: debtAsset => (collateralAsset, oracle)
+    mapping(address => address) public borrowPairCollateral;
+    mapping(address => address) public borrowPairOracle;
+
+    function setMaxBorrow(address user, uint256 amount) external {
+        maxBorrowOverrides[user] = amount;
+        maxBorrowSet[user] = true;
+    }
+
+    function clearMaxBorrowOverride(address user) external {
+        maxBorrowOverrides[user] = 0;
+        maxBorrowSet[user] = false;
+    }
+
+    function configureBorrowPair(address debtAsset, address collateralAsset, address oracle) external {
+        borrowPairCollateral[debtAsset] = collateralAsset;
+        borrowPairOracle[debtAsset] = oracle;
+    }
+
     function getMaxBorrow(address user, address asset) external view override returns (uint256) {
-        // Simplified: return 50% of collateral as max borrow
-        uint256 collateral = collateralBalances[user][asset];
-        return collateral / 2;
+        if (maxBorrowSet[user]) return maxBorrowOverrides[user];
+
+        address collateralAsset = borrowPairCollateral[asset];
+        address oracle = borrowPairOracle[asset];
+        if (collateralAsset == address(0) || oracle == address(0)) return type(uint128).max;
+
+        uint256 collateral = collateralBalances[user][collateralAsset];
+        uint256 ltv = ltvRatios[collateralAsset][asset];
+        if (ltv == 0) ltv = 0.65e18;
+
+        // maxDebtInBase = collateral * LTV / 1e18
+        uint256 maxDebtInBase = (collateral * ltv) / 1e18;
+        // Convert existing debt to base terms
+        uint256 existingDebt = debtBalances[user][asset];
+        (, int256 price, , , ) = IChainlinkAggregatorV3(oracle).latestRoundData();
+        uint256 existingDebtInBase = (existingDebt * uint256(price)) / 1e20;
+        if (existingDebtInBase >= maxDebtInBase) return 0;
+        // Convert remaining capacity to debt asset units
+        uint256 remainingBase = maxDebtInBase - existingDebtInBase;
+        return (remainingBase * 1e20) / uint256(price);
     }
 
     // ═══════════════════════════════════════════════════════════════════
