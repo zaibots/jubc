@@ -308,6 +308,8 @@ abstract contract TestCarryUSDBase is Test {
         mockJpyUsdFeed = new MockChainlinkFeed(8, "JPY / USD", BASE_JPY_PRICE);
         mockMilkman = new MockMilkman();
         mockZaibots = new MockZaibots();
+        mockZaibots.setLTV(address(mockUsdc), address(mockJUBC), 0.75e18);
+        mockZaibots.configureBorrowPair(address(mockJUBC), address(mockUsdc), address(mockJpyUsdFeed));
         _setupMilkmanPrices();
 
         vm.stopPrank();
@@ -324,8 +326,14 @@ abstract contract TestCarryUSDBase is Test {
     }
 
     function _setupMilkmanPrices() internal {
+        // jUBC (18 dec) -> USDC (6 dec): price = oraclePrice / 100
+        // At BASE_JPY_PRICE=650000 (8 dec, $0.0065/JPY): 1 jUBC = 6500 USDC units = $0.0065
         mockMilkman.setMockPrice(address(jUBC), address(usdc), 6500);
-        mockMilkman.setMockPrice(address(usdc), address(jUBC), 153846153846153846153);
+        // USDC (6 dec) -> jUBC (18 dec): price = 1e38 / oraclePrice
+        // At BASE_JPY_PRICE=650000: 1 USDC (1e6 units) -> 153.85 jUBC (1.5385e20 units)
+        // MockMilkman formula: output = (amountIn * mockPrice) / 1e18
+        // So: 1.5385e20 = (1e6 * mockPrice) / 1e18 => mockPrice = 1.5385e32
+        mockMilkman.setMockPrice(address(usdc), address(jUBC), 1e38 / uint256(BASE_JPY_PRICE));
     }
 
     // ═══════════════════════════════════════════════════════════════════
@@ -350,6 +358,7 @@ abstract contract TestCarryUSDBase is Test {
             collateralToken: config.usdc,
             debtToken: config.jUBC,
             jpyUsdOracle: config.jpyUsdFeed,
+            jpyUsdAggregator: address(0),
             twapOracle: address(twapOracle),
             milkman: config.milkman,
             priceChecker: address(priceChecker)
@@ -437,10 +446,10 @@ abstract contract TestCarryUSDBase is Test {
             mockUsdc.mint(alice, 100_000_000e6);
             mockUsdc.mint(bob, 100_000_000e6);
             mockUsdc.mint(charlie, 100_000_000e6);
-            mockUsdc.mint(address(mockMilkman), 1_000_000_000e6);
-            mockJUBC.mint(address(mockMilkman), 1_000_000_000e18);
+            mockUsdc.mint(address(mockMilkman), 1_000_000_000_000e6);
+            mockJUBC.mint(address(mockMilkman), 1_000_000_000_000e18);
             // Fund MockZaibots with jUBC for borrow liquidity
-            mockJUBC.mint(address(mockZaibots), 1_000_000_000e18);
+            mockJUBC.mint(address(mockZaibots), 1_000_000_000_000e18);
         } else {
             deal(address(usdc), alice, 100_000_000e6);
             deal(address(usdc), bob, 100_000_000e6);
@@ -506,7 +515,7 @@ abstract contract TestCarryUSDBase is Test {
 
     function _iterateRebalance() internal {
         vm.prank(keeper, keeper);
-        carryStrategy.rebalance();
+        carryStrategy.iterateRebalance();
     }
 
     function _triggerRipcord(address caller) internal {
@@ -515,17 +524,15 @@ abstract contract TestCarryUSDBase is Test {
     }
 
     function _completeLeverSwap() internal {
-        // Settle the swap in mock Milkman - tokens flow back to strategy automatically
         bytes32 swapId = mockMilkman.getLatestSwapId();
         mockMilkman.settleSwapWithPrice(swapId);
-        // The strategy should auto-update state when it receives tokens via Milkman callback
+        carryStrategy.completeSwap();
     }
 
     function _completeDeleverSwap() internal {
-        // Settle the swap in mock Milkman - tokens flow back to strategy automatically
         bytes32 swapId = mockMilkman.getLatestSwapId();
         mockMilkman.settleSwapWithPrice(swapId);
-        // The strategy should auto-update state when it receives tokens via Milkman callback
+        carryStrategy.completeSwap();
     }
 
     function _setOraclePrice(int256 price) internal {

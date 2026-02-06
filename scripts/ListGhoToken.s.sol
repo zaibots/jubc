@@ -28,8 +28,8 @@ contract ListGhoToken is Script {
 
   // ============ GHO Token Configuration - UPDATE THESE ============
   // TODO: Replace with your actual GHO token fork address
-  address constant ATOKEN_IMPL = 0x6c08bd68e2ffdd93d13b2e54227cd6468551d0f8;
-  address constant VAR_DEBT_TOKEN_IMPL = 0xa24683acfdb7b64ef89b0465c90702f06f0fc428;
+  address constant ATOKEN_IMPL = 0x6c08bD68e2FfDd93D13B2e54227cD6468551D0F8;
+  address constant VAR_DEBT_TOKEN_IMPL = 0xa24683acfdB7b64EF89b0465c90702F06f0Fc428;
   address constant GHO_TOKEN = address(0x9F88A8Ad79532AE619e4b70c520f534E78A5ba18); // <-- SET YOUR GHO TOKEN ADDRESS
 
   function run() external {

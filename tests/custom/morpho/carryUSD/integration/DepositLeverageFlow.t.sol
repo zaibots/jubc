@@ -180,15 +180,18 @@ contract DepositLeverageFlowTest is TestCarryUSDBase {
     }
 
     function test_twap_clearsWhenTargetReached() public onlyLocal {
-        _setupCollateral(10_000e6);
-        _engageStrategy();
-        _completeLeverSwap();
+        // Use _setupEngagedStrategy which completes all TWAP iterations
+        _setupEngagedStrategy(10_000e6);
 
-        // If leverage is within bounds, TWAP should clear
+        // After full engagement, TWAP should have cleared
+        assertEq(carryStrategy.twapLeverageRatio(), 0, "TWAP should clear when target reached");
+
+        // shouldRebalance should not return ITERATE
         CarryStrategy.ShouldRebalance action = carryStrategy.shouldRebalance();
-        if (action == CarryStrategy.ShouldRebalance.NONE) {
-            assertEq(carryStrategy.twapLeverageRatio(), 0, "TWAP should clear when target reached");
-        }
+        assertTrue(
+            action != CarryStrategy.ShouldRebalance.ITERATE,
+            "Should not need TWAP iteration after target reached"
+        );
     }
 
     // ═══════════════════════════════════════════════════════════════════
@@ -320,10 +323,11 @@ contract DepositLeverageFlowTest is TestCarryUSDBase {
         // Complete any remaining TWAP iterations
         while (carryStrategy.twapLeverageRatio() > 0 && carryStrategy.swapState() == CarryStrategy.SwapState.IDLE) {
             _warpPastTwapCooldown();
-            CarryStrategy.ShouldRebalance action = carryStrategy.shouldRebalance();
-            if (action == CarryStrategy.ShouldRebalance.ITERATE) {
+            if (carryStrategy.shouldRebalance() == CarryStrategy.ShouldRebalance.ITERATE) {
                 _iterateRebalance();
-                _completeLeverSwap();
+                if (carryStrategy.swapState() == CarryStrategy.SwapState.PENDING_LEVER_SWAP) {
+                    _completeLeverSwap();
+                }
             } else {
                 break;
             }
