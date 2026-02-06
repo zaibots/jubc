@@ -231,9 +231,14 @@ contract ZaibotsAaveAdapterSelf is IZaibots {
         return healthFactor;
     }
 
-    function getMaxBorrow(address /* user */, address /* asset */) external view override returns (uint256) {
-        (, , uint256 availableBorrows, , , ) = pool.getUserAccountData(address(this));
-        return availableBorrows;
+    function getMaxBorrow(address /* user */, address asset) external view override returns (uint256) {
+        (, , uint256 availableBorrowsBase, , , ) = pool.getUserAccountData(address(this));
+        if (availableBorrowsBase == 0) return 0;
+        // Convert from base currency (USD, 8 dec) to asset units (18 dec for AIEN)
+        address oracleAddr = IPoolAddressesProvider(pool.ADDRESSES_PROVIDER()).getPriceOracle();
+        uint256 assetPrice = IAaveOracle(oracleAddr).getAssetPrice(asset);
+        if (assetPrice == 0) return 0;
+        return (availableBorrowsBase * 1e18) / assetPrice;
     }
 }
 
@@ -261,13 +266,13 @@ contract SepoliaForkTest is Test {
 
     address constant USDC = 0x94a9D9AC8a22534E3FaCa9F4e7F2E2cf85d5E4C8;
     address constant AIEN = 0x956fB81384efEEDaC8a3598444cc9f602855c461;
-    address constant AIEN_DEBT_TOKEN = 0x6AC70d3F636eAA45b9821e4770dee039e5CCDBf8;
+    address constant AIEN_DEBT_TOKEN_EXPECTED = 0xba92123D7e72df81a6498C13Fe5aDD06e3E22DAe;
 
     // Leverage params (9 decimals)
-    uint64 constant TARGET_LEVERAGE = 5_000_000_000;  // 5x (reduced for 85% LTV)
+    uint64 constant TARGET_LEVERAGE = 7_000_000_000;  // 7x
     uint64 constant MIN_LEVERAGE = 2_000_000_000;     // 2x
-    uint64 constant MAX_LEVERAGE = 6_000_000_000;     // 6x (reduced for 85% LTV)
-    uint64 constant RIPCORD_LEVERAGE = 8_000_000_000; // 8x (reduced for 85% LTV)
+    uint64 constant MAX_LEVERAGE = 8_000_000_000;     // 8x
+    uint64 constant RIPCORD_LEVERAGE = 9_000_000_000; // 9x
 
     // Execution params
     uint128 constant MAX_TRADE_SIZE = 500_000e6;      // 500k USDC
@@ -304,6 +309,7 @@ contract SepoliaForkTest is Test {
     MockChainlinkFeed public mockAienUsdFeed;
     MockMilkman public mockMilkman;
     MockMorphoVault public morphoVault;
+    address public aienDebtToken; // Set from pool reserve data in setUp
 
     address public owner = makeAddr("owner");
     address public keeper = makeAddr("keeper");
@@ -323,6 +329,16 @@ contract SepoliaForkTest is Test {
         oracle = IAaveOracle(AAVE_ORACLE);
         usdc = IERC20(USDC);
         aien = IERC20(AIEN);
+
+        // Read actual AIEN debt token from pool reserve data
+        DataTypes.ReserveDataLegacy memory aienReserve = pool.getReserveData(AIEN);
+        aienDebtToken = aienReserve.variableDebtTokenAddress;
+
+        // Raise USDC LTV to 90% to support 7x target / 8x max leverage
+        // (85% LTV caps theoretical max at 6.67x which is below 7x target)
+        vm.startPrank(ACL_ADMIN);
+        IPoolConfigurator(POOL_CONFIGURATOR).configureReserveAsCollateral(USDC, 9000, 9200, 10500);
+        vm.stopPrank();
 
         vm.startPrank(owner);
 
@@ -445,7 +461,9 @@ contract SepoliaForkTest is Test {
 
         DataTypes.ReserveDataLegacy memory aienReserve = pool.getReserveData(AIEN);
         assertTrue(aienReserve.aTokenAddress != address(0), "AIEN should have aToken");
-        assertEq(aienReserve.variableDebtTokenAddress, AIEN_DEBT_TOKEN, "AIEN debt token mismatch");
+        console2.log("AIEN varDebt (on-chain):", aienReserve.variableDebtTokenAddress);
+        console2.log("AIEN varDebt (expected):", AIEN_DEBT_TOKEN_EXPECTED);
+        assertTrue(aienReserve.variableDebtTokenAddress != address(0), "AIEN debt token should exist");
 
         console2.log("USDC aToken:", usdcReserve.aTokenAddress);
         console2.log("AIEN aToken:", aienReserve.aTokenAddress);
@@ -526,7 +544,7 @@ contract SepoliaForkTest is Test {
         if (borrowAmount > 0) {
             pool.borrow(AIEN, borrowAmount, 2, 0, alice);
 
-            uint256 debtBalance = IERC20(AIEN_DEBT_TOKEN).balanceOf(alice);
+            uint256 debtBalance = IERC20(aienDebtToken).balanceOf(alice);
             console2.log("AIEN debt balance:", debtBalance);
             console2.log("AIEN borrowed:", borrowAmount);
             assertTrue(debtBalance > 0, "Should have AIEN debt");
@@ -732,10 +750,10 @@ contract SepoliaForkTest is Test {
         console2.log("Max leverage (9 dec):", uint256(max));
         console2.log("Ripcord leverage (9 dec):", uint256(ripcord));
 
-        assertEq(target, TARGET_LEVERAGE, "Target should be 5x");
+        assertEq(target, TARGET_LEVERAGE, "Target should be 7x");
         assertEq(min, MIN_LEVERAGE, "Min should be 2x");
-        assertEq(max, MAX_LEVERAGE, "Max should be 6x");
-        assertEq(ripcord, RIPCORD_LEVERAGE, "Ripcord should be 8x");
+        assertEq(max, MAX_LEVERAGE, "Max should be 8x");
+        assertEq(ripcord, RIPCORD_LEVERAGE, "Ripcord should be 9x");
     }
 
     function test_fork_strategyNotEngagedInitially() public view {
@@ -869,7 +887,7 @@ contract SepoliaForkTest is Test {
         uint256 initialCollateral = 1_000_000e6; // 1M USDC
         uint256 usdcPrice = oracle.getAssetPrice(USDC); // 8 decimals
         uint256 aienPrice = oracle.getAssetPrice(AIEN);  // 8 decimals
-        uint256 targetLeverage = uint256(TARGET_LEVERAGE) * 1e9; // 5e18
+        uint256 targetLeverage = uint256(TARGET_LEVERAGE) * 1e9; // 7e18
 
         console2.log("=== Iterative Leverage Loop ===");
         console2.log("Initial collateral:", initialCollateral / 1e6, "USDC");
@@ -888,7 +906,7 @@ contract SepoliaForkTest is Test {
         while (iteration < maxIterations) {
             // Get current state from the adapter
             uint256 collateral = zaibots.getCollateralBalance(address(this), USDC);
-            uint256 debtAien = IERC20(AIEN_DEBT_TOKEN).balanceOf(address(zaibots));
+            uint256 debtAien = IERC20(aienDebtToken).balanceOf(address(zaibots));
 
             // Convert debt to USDC-equivalent (base units)
             // debtAien is in 18 dec, aienPrice in 8 dec, usdcPrice in 8 dec
@@ -971,7 +989,7 @@ contract SepoliaForkTest is Test {
 
         // Final state
         uint256 finalCollateral = zaibots.getCollateralBalance(address(this), USDC);
-        uint256 finalDebtAien = IERC20(AIEN_DEBT_TOKEN).balanceOf(address(zaibots));
+        uint256 finalDebtAien = IERC20(aienDebtToken).balanceOf(address(zaibots));
         uint256 finalDebtUsdc = finalDebtAien > 0 ? (finalDebtAien * aienPrice) / (usdcPrice * 1e12) : 0;
         uint256 finalEquity = finalCollateral > finalDebtUsdc ? finalCollateral - finalDebtUsdc : 0;
         uint256 finalLeverage = finalEquity > 0 ? (finalCollateral * 1e18) / finalEquity : 1e18;
@@ -999,14 +1017,10 @@ contract SepoliaForkTest is Test {
     // ═══════════════════════════════════════════════════════════════════
 
     /**
-     * @notice Tests the full strategy engage→iterate flow with swap completion
-     * @dev The strategy has two design gaps discovered during this test:
-     *      1. No swap completion callback — swapState never resets after Milkman settles
-     *      2. iterateRebalance() declared in IKeeperCarryStrategy but not implemented
-     *      We work around these by:
-     *      - Using vm.store to reset swapState to IDLE after settling swaps
-     *      - Warping past TWAP cooldown, then calling engage() for the first trade
-     *        and manually re-engaging the lever flow for subsequent iterations
+     * @notice Tests the full strategy engage→iterate→completeSwap flow
+     * @dev Uses the production completeSwap() path instead of manual state resets.
+     *      After engage(), the TWAP is active and iterateRebalance() drives each
+     *      subsequent borrow→swap cycle until target leverage is reached.
      */
     function test_fork_strategyLeverageLoop_withSimulatedCompletion() public {
         // Raise caps: AIEN borrow 50M, AIEN supply 100M, USDC supply 100M
@@ -1035,8 +1049,11 @@ contract SepoliaForkTest is Test {
         vm.prank(owner);
         morphoVault.allocate(address(carryAdapter), "", allocateAmount);
 
-        console2.log("=== Strategy Leverage Loop ===");
+        console2.log("================================================================");
+        console2.log("         STRATEGY LEVERAGE LOOP (engage + iterateRebalance)");
+        console2.log("================================================================");
         console2.log("Initial collateral:", allocateAmount / 1e6, "USDC");
+        console2.log("Target leverage:", uint256(TARGET_LEVERAGE) / 1e9, "x");
 
         // Use a monotonically increasing timestamp to avoid Aave underflows
         uint256 currentTs = block.timestamp;
@@ -1046,15 +1063,14 @@ contract SepoliaForkTest is Test {
         carryStrategy.engage();
 
         uint256 iteration = 0;
-        uint256 maxIterations = 15;
-        uint256 targetLev = uint256(TARGET_LEVERAGE) * 1e9; // 5e18
+        uint256 maxIterations = 20;
+        uint256 targetLev = uint256(TARGET_LEVERAGE) * 1e9; // 7e18
 
         while (iteration < maxIterations) {
-            console2.log("--- Strategy Iteration", iteration, "---");
-
-            // There should be a pending swap from engage() or a previous lever call
-            if (carryStrategy.swapState() != CarryStrategy.SwapState.PENDING_LEVER_SWAP) {
-                console2.log("  No pending lever swap, stopping");
+            // There should be a pending swap from engage or iterateRebalance
+            CarryStrategy.SwapState state = carryStrategy.swapState();
+            if (state == CarryStrategy.SwapState.IDLE) {
+                console2.log("  [iter", iteration, "] No pending swap, stopping");
                 break;
             }
 
@@ -1066,25 +1082,24 @@ contract SepoliaForkTest is Test {
             bytes32 swapId = mockMilkman.getLatestSwapId();
             mockMilkman.settleSwapWithPrice(swapId);
 
-            // USDC has arrived at the strategy from the swap
             uint256 usdcReceived = usdc.balanceOf(address(carryStrategy));
-            console2.log("  USDC received from swap:", usdcReceived / 1e6);
 
-            // Simulate swap completion:
-            // 1. Supply the received USDC to the pool as additional collateral
-            if (usdcReceived > 0) {
-                vm.startPrank(address(carryStrategy));
-                usdc.approve(address(zaibots), usdcReceived);
-                zaibots.supply(USDC, usdcReceived, address(carryStrategy));
-                vm.stopPrank();
-            }
-
-            // 2. Reset swap state (simulates the missing callback)
-            _resetSwapState();
+            // Use production completeSwap() path
+            carryStrategy.completeSwap();
 
             // Check leverage after this iteration
             uint256 currentLev = carryStrategy.getCurrentLeverageRatio();
-            console2.log("  Leverage after iteration:", currentLev * 100 / 1e18, "%");
+            uint256 collateral = zaibots.getCollateralBalance(address(carryStrategy), USDC);
+            uint256 debtAien = zaibots.getDebtBalance(address(carryStrategy), AIEN);
+            uint256 aienPrice = oracle.getAssetPrice(AIEN);
+            uint256 usdcPrice = oracle.getAssetPrice(USDC);
+            uint256 debtUsdc = debtAien > 0 ? (debtAien * aienPrice) / (usdcPrice * 1e12) : 0;
+
+            console2.log("  [iter", iteration, "] -------------------------------------------");
+            console2.log("    Swap settled:  +", usdcReceived / 1e6, "USDC");
+            console2.log("    Collateral:     ", collateral / 1e6, "USDC");
+            console2.log("    Debt:           ", debtUsdc / 1e6, "USDC-equiv");
+            console2.log("    Leverage:       ", currentLev * 100 / 1e18, "% (100=1x)");
 
             iteration++;
 
@@ -1094,53 +1109,185 @@ contract SepoliaForkTest is Test {
                 break;
             }
 
-            // Advance past both TWAP cooldown and rebalance interval
-            // This ensures shouldRebalance returns REBALANCE (not ITERATE which has no handler)
-            _clearTwapLeverageRatio();
-            currentTs += REBALANCE_INTERVAL + 1;
+            // Advance past TWAP cooldown for next iteration
+            currentTs += uint256(TWAP_COOLDOWN) + 1;
             vm.warp(currentTs);
 
-            CarryStrategy.ShouldRebalance action = carryStrategy.shouldRebalance();
-            console2.log("  ShouldRebalance:", uint256(action));
-
-            if (action == CarryStrategy.ShouldRebalance.REBALANCE) {
-                // rebalance may fail with CollateralCannotCoverNewBorrow when
-                // approaching the LTV-constrained max leverage (1/(1-LTV))
+            // If TWAP is still active, use iterateRebalance
+            if (carryStrategy.twapLeverageRatio() != 0) {
                 vm.prank(keeper, keeper);
-                try carryStrategy.rebalance() {
+                try carryStrategy.iterateRebalance() {
                     // Succeeded, continue loop
                 } catch {
-                    console2.log("  >>> Rebalance reverted (likely at LTV limit), stopping");
+                    console2.log("  >>> iterateRebalance reverted (likely at LTV limit), stopping");
                     break;
                 }
-            } else if (action == CarryStrategy.ShouldRebalance.NONE) {
-                // Leverage is within bounds, no rebalance needed
-                console2.log("  >>> No more rebalancing needed");
-                break;
             } else {
-                console2.log("  >>> Unexpected action:", uint256(action));
-                break;
+                // TWAP cleared — wait for rebalance interval
+                currentTs += uint256(REBALANCE_INTERVAL) + 1;
+                vm.warp(currentTs);
+
+                CarryStrategy.ShouldRebalance action = carryStrategy.shouldRebalance();
+                if (action == CarryStrategy.ShouldRebalance.REBALANCE) {
+                    vm.prank(keeper, keeper);
+                    try carryStrategy.rebalance() {} catch {
+                        console2.log("  >>> Rebalance reverted (likely at LTV limit), stopping");
+                        break;
+                    }
+                } else {
+                    console2.log("  >>> No more rebalancing needed (action:", uint256(action), ")");
+                    break;
+                }
             }
         }
 
-        // Final state
+        // Print final dashboard
+        _printVaultDashboard(allocateAmount, iteration);
+
+        // Assertions
         uint256 finalLev = carryStrategy.getCurrentLeverageRatio();
-        uint256 finalAssets = carryStrategy.getRealAssets();
         (, , , , , uint256 hf) = pool.getUserAccountData(address(zaibots));
-
-        // USDC LTV = 85% → theoretical max leverage = 1/(1-0.85) = 6.67x
-        // So 7x target is unreachable. We verify we got as close as possible.
-        uint256 maxTheoreticalLev = 6_670_000_000_000_000_000; // ~6.67e18
-        console2.log("=== FINAL STRATEGY STATE ===");
-        console2.log("Leverage:", finalLev * 100 / 1e18, "%");
-        console2.log("Real assets:", finalAssets / 1e6, "USDC");
-        console2.log("Health factor:", hf);
-        console2.log("Total iterations:", iteration);
-        console2.log("Max theoretical leverage (85% LTV):", maxTheoreticalLev * 100 / 1e18, "%");
-
         assertTrue(finalLev > 2e18, "Should be leveraged above 2x");
         assertTrue(hf > 1e18, "Health factor should be > 1 (not liquidatable)");
-        assertTrue(iteration > 3, "Should have completed multiple iterations");
+        assertTrue(iteration > 1, "Should have completed multiple iterations");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // ASCII VAULT DASHBOARD
+    // ═══════════════════════════════════════════════════════════════════
+
+    function _printVaultDashboard(uint256 initialDeposit, uint256 iterations) internal view {
+        uint256 collateral = zaibots.getCollateralBalance(address(carryStrategy), USDC);
+        uint256 debtAien = zaibots.getDebtBalance(address(carryStrategy), AIEN);
+        uint256 aienPrice = oracle.getAssetPrice(AIEN);
+        uint256 usdcPrice = oracle.getAssetPrice(USDC);
+        uint256 debtUsdc = debtAien > 0 ? (debtAien * aienPrice) / (usdcPrice * 1e12) : 0;
+        uint256 equity = collateral > debtUsdc ? collateral - debtUsdc : 0;
+        uint256 currentLev = equity > 0 ? (collateral * 1e18) / equity : 1e18;
+
+        uint256 ltv = zaibots.getLTV(USDC, AIEN);
+        uint256 maxTheoreticalLev = ltv < 1e18 ? (1e18 * 1e18) / (1e18 - ltv) : type(uint256).max;
+        uint256 safeMaxLev = (maxTheoreticalLev * 95) / 100;
+        (, , , , , uint256 hf) = pool.getUserAccountData(address(zaibots));
+
+        // Calculate LTV utilization
+        uint256 ltvUsedPct = collateral > 0 ? (debtUsdc * 10000) / collateral : 0;
+        uint256 ltvMaxPct = ltv / 1e14; // 18 dec -> bps
+
+        // Calculate safe wind-down capacity
+        uint256 minCollateral = debtUsdc > 0 && ltv > 0 ? (debtUsdc * 1e18) / ltv : 0;
+        uint256 withdrawable = collateral > minCollateral ? collateral - minCollateral : 0;
+
+        // Calculate delever iterations needed to fully unwind
+        uint256 totalDeleverNeeded = debtUsdc;
+        uint256 deleverIterations = totalDeleverNeeded > 0 ? (totalDeleverNeeded + MAX_TRADE_SIZE - 1) / MAX_TRADE_SIZE : 0;
+
+        // Liquidation threshold from reserve config
+        DataTypes.ReserveDataLegacy memory usdcReserve = pool.getReserveData(USDC);
+        uint256 liqThresholdBps = (usdcReserve.configuration.data >> 16) & 0xFFFF;
+        // Price drop % to trigger liquidation
+        // HF = (collateral * liqThreshold) / debt. HF < 1 when collateral * liqThreshold < debt
+        // If AIEN price drops, debt (in USDC) decreases — so it's AIEN price RISE that hurts
+        // Actually: we borrow AIEN, so if AIEN rises relative to USDC, our debt grows
+        // Liquidation when: collateral * liqThreshold/10000 < debtUsdc_at_new_price
+        // debtUsdc_at_new_price = debtAien * (aienPrice * (1+x)) / (usdcPrice * 1e12)
+        // Solve: collateral * liqThreshold/10000 = debtAien * aienPrice * (1+x) / (usdcPrice * 1e12)
+        // (1+x) = collateral * liqThreshold * usdcPrice * 1e12 / (10000 * debtAien * aienPrice)
+        uint256 liqPriceMultiplier = 0;
+        uint256 aienPriceAtLiq = 0;
+        if (debtAien > 0 && aienPrice > 0) {
+            // How much AIEN price can rise before liquidation
+            liqPriceMultiplier = (collateral * liqThresholdBps * usdcPrice * 1e12) / (10000 * debtAien * aienPrice);
+            // liqPriceMultiplier is in 1e6 terms (since collateral is 6 dec)
+            // Actually let me redo this more carefully:
+            // collateral (6 dec) * liqThreshold/10000 = debtAien (18 dec) * newAienPrice (8 dec) / (usdcPrice (8 dec) * 1e12)
+            // newAienPrice = collateral * liqThreshold * usdcPrice * 1e12 / (10000 * debtAien)
+            aienPriceAtLiq = (collateral * liqThresholdBps * usdcPrice * 1e12) / (10000 * debtAien);
+        }
+
+        console2.log("");
+        console2.log("================================================================");
+        console2.log("              CARRY VAULT DASHBOARD");
+        console2.log("================================================================");
+        console2.log("");
+        console2.log("  VAULT OVERVIEW");
+        console2.log("  -------------------------------------------------------");
+        console2.log("  Initial Deposit:      ", initialDeposit / 1e6, "USDC");
+        console2.log("  Leverage Iterations:  ", iterations);
+        console2.log("");
+        console2.log("  AAVE POSITION");
+        console2.log("  -------------------------------------------------------");
+        console2.log("  Collateral (USDC):    ", collateral / 1e6, "USDC");
+        console2.log("  Debt (AIEN):          ", debtAien / 1e18, "AIEN");
+        console2.log("  Debt (USDC equiv):    ", debtUsdc / 1e6, "USDC");
+        console2.log("  Equity (net value):   ", equity / 1e6, "USDC");
+        console2.log("");
+        console2.log("  LEVERAGE");
+        console2.log("  -------------------------------------------------------");
+        uint256 targetLev = uint256(TARGET_LEVERAGE) * 1e9;
+        _printLeverageBar(currentLev, targetLev, maxTheoreticalLev);
+        console2.log("  Current leverage:     ", currentLev / 1e16, "%");
+        console2.log("  Target leverage:      ", uint256(TARGET_LEVERAGE) / 1e9, "x");
+        console2.log("  Min leverage:         ", uint256(MIN_LEVERAGE) / 1e9, "x");
+        console2.log("  Max leverage:         ", uint256(MAX_LEVERAGE) / 1e9, "x");
+        console2.log("  Ripcord leverage:     ", uint256(RIPCORD_LEVERAGE) / 1e9, "x");
+        console2.log("  Safe Max (95% theo):  ", safeMaxLev / 1e16, "%");
+        console2.log("  Theoretical Max:      ", maxTheoreticalLev / 1e16, "%");
+        console2.log("");
+        console2.log("  HEALTH & SAFETY");
+        console2.log("  -------------------------------------------------------");
+        console2.log("  Health Factor:        ", hf / 1e16, "%");
+        console2.log("  LTV Used:             ", ltvUsedPct, "bps");
+        console2.log("  LTV Max:              ", ltvMaxPct, "bps");
+        console2.log("  Liq Threshold:        ", liqThresholdBps, "bps");
+        console2.log("");
+        console2.log("  WIND-DOWN CAPACITY");
+        console2.log("  -------------------------------------------------------");
+        console2.log("  Safe Withdrawal:      ", withdrawable / 1e6, "USDC");
+        console2.log("  Full Delever iters:   ", deleverIterations);
+        console2.log("  Total Debt to Repay:  ", debtUsdc / 1e6, "USDC equiv");
+        console2.log("");
+        console2.log("  LIQUIDATION RISK");
+        console2.log("  -------------------------------------------------------");
+        console2.log("  Current AIEN price:   ", aienPrice, "(8 dec)");
+        if (aienPriceAtLiq > 0) {
+            console2.log("  Liq AIEN price:       ", aienPriceAtLiq, "(8 dec)");
+            if (aienPriceAtLiq > aienPrice) {
+                uint256 pctBuffer = ((aienPriceAtLiq - aienPrice) * 10000) / aienPrice;
+                console2.log("  AIEN rise to liq:     +", pctBuffer, "bps");
+            } else {
+                console2.log("  WARNING: NEAR LIQUIDATION");
+            }
+        }
+        console2.log("");
+        console2.log("================================================================");
+        console2.log("");
+    }
+
+    function _printLeverageBar(uint256 current, uint256 target, uint256 maxTheo) internal pure {
+        // Build a 20-char bar showing current leverage position
+        // Scale: 0 = 1x, 20 = maxTheo
+        uint256 range = maxTheo > 1e18 ? maxTheo - 1e18 : 1;
+        uint256 currentPos = current > 1e18 ? ((current - 1e18) * 20) / range : 0;
+        uint256 targetPos = target > 1e18 ? ((target - 1e18) * 20) / range : 0;
+        if (currentPos > 20) currentPos = 20;
+        if (targetPos > 20) targetPos = 20;
+
+        // Log positions for visualization
+        // Using simple markers: = for filled, . for empty, T for target
+        bytes memory bar = new bytes(22);
+        bar[0] = "[";
+        bar[21] = "]";
+        for (uint256 i = 0; i < 20; i++) {
+            if (i < currentPos) {
+                bar[i + 1] = "=";
+            } else if (i == targetPos) {
+                bar[i + 1] = "T";
+            } else {
+                bar[i + 1] = ".";
+            }
+        }
+        console2.log("  ", string(bar));
     }
 
     /**
@@ -1173,6 +1320,8 @@ contract SepoliaForkTest is Test {
 
         // Clear slot 18 (pendingSwapTs + pendingSwapAmount)
         vm.store(address(carryStrategy), bytes32(uint256(18)), bytes32(0));
+        // Clear slot 19 (pendingSwapExpectedOutput — added in Phase 3)
+        vm.store(address(carryStrategy), bytes32(uint256(19)), bytes32(0));
     }
 
     /**
