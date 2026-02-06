@@ -302,11 +302,11 @@ contract OracleFailuresTest is TestCarryUSDBase {
         _engageStrategy();
         _completeLeverSwap();
 
+        // Complete any remaining TWAP iterations
         while (carryStrategy.twapLeverageRatio() > 0 && carryStrategy.swapState() == CarryStrategy.SwapState.IDLE) {
             _warpPastTwapCooldown();
             if (carryStrategy.shouldRebalance() == CarryStrategy.ShouldRebalance.ITERATE) {
                 _iterateRebalance();
-                // Only complete swap if one was created
                 if (carryStrategy.swapState() == CarryStrategy.SwapState.PENDING_LEVER_SWAP) {
                     _completeLeverSwap();
                 }

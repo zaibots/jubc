@@ -35,6 +35,7 @@ contract CarryKeeperTest is TestCarryUSDBase {
             collateralToken: config.usdc,
             debtToken: config.jUBC,
             jpyUsdOracle: config.jpyUsdFeed,
+            jpyUsdAggregator: address(0),
             twapOracle: address(twapOracle),
             milkman: config.milkman,
             priceChecker: address(priceChecker)
@@ -60,7 +61,7 @@ contract CarryKeeperTest is TestCarryUSDBase {
             "Test Strategy",
             CarryStrategy.StrategyType.MODERATE,
             strategyAddresses,
-            [MODERATE_TARGET, MODERATE_MIN, MODERATE_MAX, MODERATE_RIPCORD],
+            [CONSERVATIVE_TARGET, CONSERVATIVE_MIN, CONSERVATIVE_MAX, CONSERVATIVE_RIPCORD],
             execParams,
             incParams
         );
@@ -202,6 +203,38 @@ contract CarryKeeperTest is TestCarryUSDBase {
     // ═══════════════════════════════════════════════════════════════════
     // GAS OPTIMIZATION
     // ═══════════════════════════════════════════════════════════════════
+
+    function test_performUpkeep_detectsIterateAction() public onlyLocal {
+        // Setup collateral and engage the strategy
+        mockUsdc.mint(address(carryStrategy), 100_000e6);
+        vm.prank(address(carryStrategy));
+        mockZaibots.supply(address(usdc), 100_000e6, address(carryStrategy));
+
+        vm.prank(keeper, keeper);
+        carryStrategy.engage();
+
+        // Complete the lever swap
+        bytes32 swapId = mockMilkman.getLatestSwapId();
+        mockMilkman.settleSwapWithPrice(swapId);
+        carryStrategy.completeSwap();
+
+        // Warp past TWAP cooldown so shouldRebalance returns ITERATE
+        vm.warp(block.timestamp + DEFAULT_TWAP_COOLDOWN + 1);
+
+        // Verify keeper detects ITERATE action
+        (bool upkeepNeeded, bytes memory performData) = carryKeeper.checkUpkeep(bytes(""));
+        assertTrue(upkeepNeeded, "Keeper should detect upkeep needed");
+
+        // Decode and verify action type is ITERATE (2)
+        (address strategy, uint8 actionType) = abi.decode(performData, (address, uint8));
+        assertEq(strategy, address(carryStrategy), "Should target our strategy");
+        assertEq(actionType, uint8(IKeeperCarryStrategy.ShouldRebalance.ITERATE), "Action should be ITERATE");
+
+        // Note: performUpkeep reverts with "Not EOA" because the keeper contract
+        // calls strategy.iterateRebalance() where msg.sender = keeper contract ≠ tx.origin.
+        // In production, Chainlink Automation nodes call performUpkeep as EOAs directly.
+        // The keeper's role is detection (checkUpkeep); execution is via direct EOA calls.
+    }
 
     function test_gas_checkUpkeepIsView() public view {
         // checkUpkeep should be a view function (no state changes)

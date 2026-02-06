@@ -56,6 +56,7 @@ contract DeployUBCMarket is DeployUtils, MarketInput, Script {
   // Chainlink Data Streams
   address public verifierProxy;
   bytes32 public jpyUsdFeedId;
+  address public jpyUsdAggregatorFeed;
 
   // External addresses (set per network)
   address public wrappedNative;
@@ -187,7 +188,9 @@ contract DeployUBCMarket is DeployUtils, MarketInput, Script {
 
     IJUBCToken(jUBCToken).grantRole(FACILITATOR_MANAGER_ROLE, admin);
     IJUBCToken(jUBCToken).grantRole(BUCKET_MANAGER_ROLE, admin);
-    jpyUsdOracle.setKeeperAuthorization(admin, true);
+
+    // Authorize keeper for oracle (only if verifierProxy is set)
+    if (verifierProxy != address(0)) jpyUsdOracle.setKeeperAuthorization(admin, true);
 
     console2.log('  Roles configured');
 
@@ -240,6 +243,7 @@ contract DeployUBCMarket is DeployUtils, MarketInput, Script {
     // Chainlink Data Streams config
     verifierProxy = vm.envOr('VERIFIER_PROXY', address(0x2ff010DEbC1297f19579B4246cad07bd24F2488A));
     jpyUsdFeedId = vm.envOr('JPY_USD_FEED_ID', keccak256('JPY/USD'));
+    jpyUsdAggregatorFeed = vm.envOr('AGGREGATOR_FEED', address(0));
 
     // Network addresses - default to mainnet
     wrappedNative = vm.envOr('WRAPPED_NATIVE', address(0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2)); // WETH

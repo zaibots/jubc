@@ -28,6 +28,7 @@ contract CarryStrategy is Ownable, ReentrancyGuard {
     address collateralToken;
     address debtToken;
     address jpyUsdOracle;
+    address jpyUsdAggregator;
     address twapOracle;
     address milkman;
     address priceChecker;
@@ -68,6 +69,7 @@ contract CarryStrategy is Ownable, ReentrancyGuard {
   uint64 public lastTradeTs;
   uint64 public pendingSwapTs;
   uint128 public pendingSwapAmount;
+  uint128 public pendingSwapExpectedOutput;
 
   mapping(address => bool) public isAllowedCaller;
   address public operator;
@@ -83,11 +85,17 @@ contract CarryStrategy is Ownable, ReentrancyGuard {
   event Ripcorded(address indexed caller, uint256 leverage, uint256 reward);
   event AssetsReceived(uint256 amount);
   event AssetsWithdrawn(uint256 amount);
+  event SwapCompleted(SwapState swapType, uint256 amount);
+  event SwapCancelled(SwapState swapType, uint256 pendingAmount);
+  event LTVSynced(uint256 currentLTV, bool stillValid);
+  event StrategyAutoDeactivated(string reason);
 
   error NotAllowedCaller();
   error NotOperator();
   error NotAdapter();
   error SwapPending();
+  error SwapNotPending();
+  error SwapNotTimedOut();
   error LeverageTooHigh();
   error LeverageTooLow();
   error RebalanceIntervalNotElapsed();
@@ -97,6 +105,8 @@ contract CarryStrategy is Ownable, ReentrancyGuard {
   error NotEngaged();
   error InsufficientEtherReward();
   error InsufficientAssets();
+  error LeverageExceedsLTVLimit();
+  error SwapOutputTooLow();
 
   modifier onlyAllowedCaller() {
     if (!isAllowedCaller[msg.sender] && msg.sender != operator && msg.sender != owner()) revert NotAllowedCaller();
@@ -145,6 +155,7 @@ contract CarryStrategy is Ownable, ReentrancyGuard {
     operator = msg.sender;
     isActive = true;
     swapState = SwapState.IDLE;
+    _validateLeverageParams(_leverage[0], _leverage[2]);
     IERC20(_addresses.collateralToken).approve(_addresses.zaibots, type(uint256).max);
     IERC20(_addresses.debtToken).approve(_addresses.zaibots, type(uint256).max);
     IERC20(_addresses.debtToken).approve(_addresses.milkman, type(uint256).max);
@@ -170,6 +181,12 @@ contract CarryStrategy is Ownable, ReentrancyGuard {
     if (currentLev > FULL_PRECISION + 1e16) revert AlreadyEngaged();
     uint256 collateral = _getCollateralBalance();
     if (collateral == 0) revert NotEngaged();
+    // Defense-in-depth: verify LTV still supports target leverage
+    uint256 ltv = _getLTV();
+    if (ltv > 0 && ltv < FULL_PRECISION) {
+      uint256 complement = FULL_PRECISION - ltv;
+      if (uint256(leverage.target) * complement >= 1e27) revert LeverageExceedsLTVLimit();
+    }
     twapLeverageRatio = leverage.target;
     _lever(_calculateLeverAmount());
     emit Engaged(collateral, uint256(leverage.target) * 1e9);
@@ -191,7 +208,36 @@ contract CarryStrategy is Ownable, ReentrancyGuard {
     lastRebalanceTs = uint64(block.timestamp);
   }
 
-  function ripcord() external onlyEOA nonReentrant {
+  function iterateRebalance() external onlyEOA onlyAllowedCaller whenActive whenNoSwap nonReentrant {
+    if (twapLeverageRatio == 0) revert TwapNotActive();
+    if (block.timestamp < lastTradeTs + execution.twapCooldown) revert RebalanceIntervalNotElapsed();
+    uint256 currentLev = getCurrentLeverageRatio();
+    uint256 twapTarget = uint256(twapLeverageRatio) * 1e9;
+    if (currentLev < twapTarget) {
+      uint256 leverAmount = _calculateLeverAmount();
+      bool fitsInOneTrade = leverAmount <= uint256(execution.maxTradeSize);
+      uint256 actualTrade = _lever(leverAmount);
+      // Only clear TWAP if full amount fits AND was fully executed (not borrow-capped)
+      if (fitsInOneTrade && actualTrade > 0) {
+        twapLeverageRatio = 0;
+      } else if (swapState == SwapState.IDLE) {
+        // No swap was created (zero borrow capacity) — skip but keep TWAP active
+        lastTradeTs = uint64(block.timestamp);
+        emit Rebalanced(currentLev, twapTarget, true);
+        return;
+      }
+      // else: swap created but capped or multi-trade → TWAP persists
+    } else if (currentLev > twapTarget) {
+      uint256 deleverAmount = _calculateDeleverAmount(currentLev, twapTarget);
+      if (deleverAmount <= uint256(execution.maxTradeSize)) twapLeverageRatio = 0;
+      _delever(deleverAmount);
+    } else {
+      twapLeverageRatio = 0;
+    }
+    emit Rebalanced(currentLev, twapTarget, currentLev < twapTarget);
+  }
+
+  function ripcord() external onlyEOA whenNoSwap nonReentrant {
     uint256 currentLev = getCurrentLeverageRatio();
     if (currentLev < uint256(leverage.ripcord) * 1e9) revert LeverageTooLow();
     uint256 deleverAmount = _min(_calculateDeleverAmount(currentLev, uint256(leverage.max) * 1e9), uint256(incentive.maxTrade));
@@ -202,6 +248,46 @@ contract CarryStrategy is Ownable, ReentrancyGuard {
     require(success, 'ETH transfer failed');
     emit Ripcorded(msg.sender, currentLev, reward);
     lastTradeTs = uint64(block.timestamp);
+  }
+
+  function completeSwap() external nonReentrant {
+    if (swapState == SwapState.IDLE) revert SwapNotPending();
+    SwapState completedType = swapState;
+    uint128 expectedOutput = pendingSwapExpectedOutput;
+
+    // Effects: clear state BEFORE interactions (CEI pattern)
+    swapState = SwapState.IDLE;
+    pendingSwapTs = 0;
+    pendingSwapAmount = 0;
+    pendingSwapExpectedOutput = 0;
+
+    uint256 amount;
+    if (completedType == SwapState.PENDING_LEVER_SWAP) {
+      amount = IERC20(addr.collateralToken).balanceOf(address(this));
+      if (amount > 0 && amount < expectedOutput) revert SwapOutputTooLow();
+      if (amount > 0) {
+        IZaibots(addr.zaibots).supply(addr.collateralToken, amount, address(this));
+      }
+    } else {
+      amount = IERC20(addr.debtToken).balanceOf(address(this));
+      if (amount > 0 && amount < expectedOutput) revert SwapOutputTooLow();
+      if (amount > 0) {
+        IZaibots(addr.zaibots).repay(addr.debtToken, amount, address(this));
+      }
+    }
+    emit SwapCompleted(completedType, amount);
+  }
+
+  function cancelTimedOutSwap() external onlyAllowedCaller nonReentrant {
+    if (swapState == SwapState.IDLE) revert SwapNotPending();
+    if (block.timestamp < pendingSwapTs + SWAP_TIMEOUT) revert SwapNotTimedOut();
+    SwapState cancelledType = swapState;
+    uint128 cancelledAmount = pendingSwapAmount;
+    swapState = SwapState.IDLE;
+    pendingSwapTs = 0;
+    pendingSwapAmount = 0;
+    pendingSwapExpectedOutput = 0;
+    emit SwapCancelled(cancelledType, cancelledAmount);
   }
 
   function getCurrentLeverageRatio() public view returns (uint256) {
@@ -232,26 +318,68 @@ contract CarryStrategy is Ownable, ReentrancyGuard {
   function getRealAssets() public view returns (uint256) {
     uint256 collateral = _getCollateralBalance();
     uint256 debt = _getDebtBalanceInBase();
-    if (swapState == SwapState.PENDING_LEVER_SWAP) return collateral > debt ? collateral - debt - pendingSwapAmount : 0;
-    return collateral > debt ? collateral - debt : 0;
+    uint256 equity = collateral > debt ? collateral - debt : 0;
+    if (swapState == SwapState.PENDING_LEVER_SWAP) return equity > pendingSwapAmount ? equity - pendingSwapAmount : 0;
+    return equity;
   }
 
   function isEngaged() external view returns (bool) {
     return getCurrentLeverageRatio() > FULL_PRECISION + 1e16;
   }
 
-  function _lever(uint256 _notionalBase) internal {
-    if (_notionalBase == 0) return;
+  /// @notice Max leverage given current LTV: 1 / (1 - LTV)
+  function getMaxAchievableLeverage() public view returns (uint256) {
+    uint256 ltv = _getLTV();
+    if (ltv == 0) return FULL_PRECISION;
+    if (ltv >= FULL_PRECISION) return type(uint256).max;
+    return (FULL_PRECISION * FULL_PRECISION) / (FULL_PRECISION - ltv);
+  }
+
+  function _lever(uint256 _notionalBase) internal returns (uint256 actualTradeSize) {
+    if (_notionalBase == 0) return 0;
     uint256 tradeSize = _min(_notionalBase, execution.maxTradeSize);
     if (_notionalBase > execution.maxTradeSize) twapLeverageRatio = leverage.target;
     uint256 debtToBorrow = _calculateDebtBorrowAmount(tradeSize);
+    uint256 maxBorrow = IZaibots(addr.zaibots).getMaxBorrow(address(this), addr.debtToken);
+    maxBorrow = (maxBorrow * 95) / 100;
+    bool wasCapped = false;
+    if (debtToBorrow > maxBorrow) {
+      if (maxBorrow == 0) return 0;
+      debtToBorrow = maxBorrow;
+      wasCapped = true;
+    }
+    // Pre-borrow projected leverage check
+    {
+      uint256 safeLev = (getMaxAchievableLeverage() * 95) / 100;
+      uint256 currentCollateral = _getCollateralBalance();
+      uint256 currentDebt = _getDebtBalanceInBase();
+      (, int256 _price, , , ) = IChainlinkAggregatorV3(addr.jpyUsdOracle != address(0) ? addr.jpyUsdOracle : addr.jpyUsdAggregator).latestRoundData();
+      uint256 newDebtInBase = currentDebt + (debtToBorrow * uint256(_price)) / 1e20;
+      uint256 equity = currentCollateral > newDebtInBase ? currentCollateral - newDebtInBase : 0;
+      if (equity > 0) {
+        uint256 projectedLev = (currentCollateral * FULL_PRECISION) / equity;
+        if (projectedLev > safeLev) {
+          // Scale back borrow to stay within safe leverage
+          uint256 maxDebtInBase = currentCollateral - (currentCollateral * FULL_PRECISION) / safeLev;
+          if (maxDebtInBase <= currentDebt) return 0;
+          uint256 allowedNewDebtBase = maxDebtInBase - currentDebt;
+          debtToBorrow = (allowedNewDebtBase * 1e20) / uint256(_price);
+          if (debtToBorrow == 0) return 0;
+          wasCapped = true;
+        }
+      }
+    }
     IZaibots(addr.zaibots).borrow(addr.debtToken, debtToBorrow, address(this));
+    // Calculate expected output: JPY→USDC, with 2x slippage buffer
+    pendingSwapExpectedOutput = uint128(_calculateExpectedLeverOutput(debtToBorrow));
     bytes memory priceCheckerData = abi.encode(execution.slippageBps, addr.priceChecker);
     IMilkman(addr.milkman).requestSwapExactTokensForTokens(debtToBorrow, IERC20(addr.debtToken), IERC20(addr.collateralToken), address(this), addr.priceChecker, priceCheckerData);
     swapState = SwapState.PENDING_LEVER_SWAP;
     pendingSwapTs = uint64(block.timestamp);
     pendingSwapAmount = uint128(tradeSize);
     lastTradeTs = uint64(block.timestamp);
+    // Return 0 when capped to signal partial execution; use swapState to check if swap was created
+    return wasCapped ? 0 : tradeSize;
   }
 
   function _delever(uint256 _notionalBase) internal {
@@ -262,6 +390,8 @@ contract CarryStrategy is Ownable, ReentrancyGuard {
     if (_notionalBase == 0) return;
     uint256 tradeSize = _min(_notionalBase, execution.maxTradeSize);
     IZaibots(addr.zaibots).withdraw(addr.collateralToken, tradeSize, address(this));
+    // Calculate expected output: USDC→JPY, with 2x slippage buffer
+    pendingSwapExpectedOutput = uint128(_calculateExpectedDeleverOutput(tradeSize));
     bytes memory priceCheckerData = abi.encode(_slippageBps, addr.priceChecker);
     IMilkman(addr.milkman).requestSwapExactTokensForTokens(tradeSize, IERC20(addr.collateralToken), IERC20(addr.debtToken), address(this), addr.priceChecker, priceCheckerData);
     swapState = SwapState.PENDING_DELEVER_SWAP;
@@ -281,7 +411,7 @@ contract CarryStrategy is Ownable, ReentrancyGuard {
   function _getDebtBalanceInBase() internal view returns (uint256) {
     uint256 debtBalance = _getDebtBalance();
     if (debtBalance == 0) return 0;
-    (, int256 price, , , ) = IChainlinkAggregatorV3(addr.jpyUsdOracle).latestRoundData();
+    (, int256 price, , , ) = IChainlinkAggregatorV3(addr.jpyUsdOracle != address(0) ? addr.jpyUsdOracle : addr.jpyUsdAggregator).latestRoundData();
     return (debtBalance * uint256(price)) / 1e20;
   }
 
@@ -298,7 +428,7 @@ contract CarryStrategy is Ownable, ReentrancyGuard {
   }
 
   function _calculateDebtBorrowAmount(uint256 baseAmount) internal view returns (uint256) {
-    (, int256 price, , , ) = IChainlinkAggregatorV3(addr.jpyUsdOracle).latestRoundData();
+    (, int256 price, , , ) = IChainlinkAggregatorV3(addr.jpyUsdOracle != address(0) ? addr.jpyUsdOracle : addr.jpyUsdAggregator).latestRoundData();
     uint256 jpyAmount = (baseAmount * 1e20) / uint256(price);
     uint256 ltv = _getLTV();
     return (jpyAmount * ltv) / FULL_PRECISION;
@@ -315,6 +445,9 @@ contract CarryStrategy is Ownable, ReentrancyGuard {
     uint256 collateral = _getCollateralBalance();
     uint256 currentLev = getCurrentLeverageRatio();
     uint256 targetLev = uint256(leverage.target) * 1e9;
+    // Cap to 95% of theoretical max to prevent exceeding LTV
+    uint256 safeLev = (getMaxAchievableLeverage() * 95) / 100;
+    if (targetLev > safeLev) targetLev = safeLev;
     if (currentLev >= targetLev) return 0;
     uint256 debt = _getDebtBalanceInBase();
     uint256 equity = collateral > debt ? collateral - debt : 0;
@@ -330,12 +463,60 @@ contract CarryStrategy is Ownable, ReentrancyGuard {
     return collateral > targetCollateral ? collateral - targetCollateral : 0;
   }
 
+  function _validateLeverageParams(uint64 target, uint64 maxLev) internal view {
+    if (addr.zaibots == address(0) || addr.zaibots == address(1)) return;
+    uint256 ltv = IZaibots(addr.zaibots).getLTV(addr.collateralToken, addr.debtToken);
+    if (ltv == 0 || ltv >= FULL_PRECISION) return;
+    uint256 complement = FULL_PRECISION - ltv;
+    if (uint256(target) * complement >= 1e27) revert LeverageExceedsLTVLimit();
+    if (uint256(maxLev) * complement >= 1e27) revert LeverageExceedsLTVLimit();
+  }
+
+  /// @notice Expected USDC output from selling jpyAmount of debt token (lever: JPY→USDC)
+  function _calculateExpectedLeverOutput(uint256 jpyAmount) internal view returns (uint256) {
+    (, int256 price, , , ) = IChainlinkAggregatorV3(addr.jpyUsdOracle != address(0) ? addr.jpyUsdOracle : addr.jpyUsdAggregator).latestRoundData();
+    uint256 usdcAmount = (jpyAmount * uint256(price)) / 1e20;
+    // Apply 2x slippage tolerance as minimum output threshold
+    return (usdcAmount * (MAX_BPS - uint256(execution.slippageBps) * 2)) / MAX_BPS;
+  }
+
+  /// @notice Expected JPY output from selling usdcAmount of collateral (delever: USDC→JPY)
+  function _calculateExpectedDeleverOutput(uint256 usdcAmount) internal view returns (uint256) {
+    (, int256 price, , , ) = IChainlinkAggregatorV3(addr.jpyUsdOracle != address(0) ? addr.jpyUsdOracle : addr.jpyUsdAggregator).latestRoundData();
+    uint256 jpyAmount = (usdcAmount * 1e20) / uint256(price);
+    // Apply 2x slippage tolerance as minimum output threshold
+    return (jpyAmount * (MAX_BPS - uint256(execution.slippageBps) * 2)) / MAX_BPS;
+  }
+
   function _min(uint256 a, uint256 b) internal pure returns (uint256) {
     return a < b ? a : b;
   }
 
   function setActive(bool _isActive) external onlyOperator {
     isActive = _isActive;
+  }
+
+  /// @notice Permissionless — re-validate LTV, auto-deactivate if target is unreachable
+  function syncLTV() external returns (bool valid) {
+    uint256 ltv = _getLTV();
+    if (ltv == 0 || ltv >= FULL_PRECISION) { emit LTVSynced(ltv, true); return true; }
+    uint256 complement = FULL_PRECISION - ltv;
+    valid = uint256(leverage.target) * complement < 1e27
+         && uint256(leverage.max) * complement < 1e27;
+    if (!valid && isActive) {
+      isActive = false;
+      emit StrategyAutoDeactivated("LTV no longer supports target leverage");
+    }
+    emit LTVSynced(ltv, valid);
+  }
+
+  /// @notice View: check if current LTV still supports our leverage params
+  function isLTVValid() external view returns (bool) {
+    uint256 ltv = _getLTV();
+    if (ltv == 0 || ltv >= FULL_PRECISION) return true;
+    uint256 complement = FULL_PRECISION - ltv;
+    return uint256(leverage.target) * complement < 1e27
+        && uint256(leverage.max) * complement < 1e27;
   }
 
   function setAllowedCaller(address _caller, bool _isAllowed) external onlyOperator {
