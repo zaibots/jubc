@@ -21,16 +21,16 @@ contract ListGhoToken is Script {
   // ============ Sepolia Aave V3 Deployment Addresses ============
   address constant POOL_ADDRESSES_PROVIDER = 0xc183d9509425B9f1e08320AE1612C2Ee7de7EC4D;
   address constant POOL_CONFIGURATOR = 0x888C7478060755Bb3E796D2F8534821202285aF1;
-  address constant ATOKEN_IMPL = 0x8caF46fC502569A43b6ADfC230e73C55a3A51097;
-  address constant VAR_DEBT_TOKEN_IMPL = 0x8da3B983e8029e9802F8Fb9B6745f01b663e4903;
   address constant AAVE_ORACLE = 0xdA55C5b54655819118EeF2c32b8ff3b022a7Cb8c;
   address constant ACL_MANAGER = 0xf5ef7CaF1444a1396e909e07325f3a5Ff99dA69A;
+  // TODO: Replace with your GHO price oracle address (or use a mock oracle)
+  address constant GHO_ORACLE = address(0xB0C712f98daE15264c8E26132BCC91C40aD4d5F9); // <-- SET YOUR GHO ORACLE ADDRESS
 
   // ============ GHO Token Configuration - UPDATE THESE ============
   // TODO: Replace with your actual GHO token fork address
+  address constant ATOKEN_IMPL = 0x6c08bd68e2ffdd93d13b2e54227cd6468551d0f8;
+  address constant VAR_DEBT_TOKEN_IMPL = 0xa24683acfdb7b64ef89b0465c90702f06f0fc428;
   address constant GHO_TOKEN = address(0x9F88A8Ad79532AE619e4b70c520f534E78A5ba18); // <-- SET YOUR GHO TOKEN ADDRESS
-  // TODO: Replace with your GHO price oracle address (or use a mock oracle)
-  address constant GHO_ORACLE = address(0xB0C712f98daE15264c8E26132BCC91C40aD4d5F9); // <-- SET YOUR GHO ORACLE ADDRESS
 
   function run() external {
     require(GHO_TOKEN != address(0), 'GHO_TOKEN address not set');
