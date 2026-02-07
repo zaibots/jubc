@@ -8,7 +8,8 @@ import {ReentrancyGuard} from 'openzeppelin-contracts/contracts/utils/Reentrancy
 
 import {IChainlinkAggregatorV3} from '../../integrations/morpho/interfaces/IChainlinkAutomation.sol';
 import {IMilkman} from '../../integrations/morpho/interfaces/IMilkman.sol';
-import {IZaibots} from '../../integrations/morpho/interfaces/IZaibots.sol';
+import {IPool} from 'aave-v3-origin/contracts/interfaces/IPool.sol';
+import {DataTypes} from 'aave-v3-origin/contracts/protocol/libraries/types/DataTypes.sol';
 import {ILinearBlockTwapOracle} from './LinearBlockTwapOracle.sol';
 
 /**
@@ -164,7 +165,7 @@ contract CarryStrategy is Ownable, ReentrancyGuard {
 
   function receiveAssets(uint256 amount) external onlyAdapter nonReentrant {
     IERC20(addr.collateralToken).safeTransferFrom(msg.sender, address(this), amount);
-    IZaibots(addr.zaibots).supply(addr.collateralToken, amount, address(this));
+    IPool(addr.zaibots).supply(addr.collateralToken, amount, address(this), 0);
     emit AssetsReceived(amount);
   }
 
@@ -172,7 +173,7 @@ contract CarryStrategy is Ownable, ReentrancyGuard {
     uint256 available = _getAvailableCollateral();
     uint256 toWithdraw = amount < available ? amount : available;
     if (toWithdraw == 0) revert InsufficientAssets();
-    withdrawn = IZaibots(addr.zaibots).withdraw(addr.collateralToken, toWithdraw, msg.sender);
+    withdrawn = IPool(addr.zaibots).withdraw(addr.collateralToken, toWithdraw, msg.sender);
     emit AssetsWithdrawn(withdrawn);
   }
 
@@ -266,13 +267,13 @@ contract CarryStrategy is Ownable, ReentrancyGuard {
       amount = IERC20(addr.collateralToken).balanceOf(address(this));
       if (amount > 0 && amount < expectedOutput) revert SwapOutputTooLow();
       if (amount > 0) {
-        IZaibots(addr.zaibots).supply(addr.collateralToken, amount, address(this));
+        IPool(addr.zaibots).supply(addr.collateralToken, amount, address(this), 0);
       }
     } else {
       amount = IERC20(addr.debtToken).balanceOf(address(this));
       if (amount > 0 && amount < expectedOutput) revert SwapOutputTooLow();
       if (amount > 0) {
-        IZaibots(addr.zaibots).repay(addr.debtToken, amount, address(this));
+        IPool(addr.zaibots).repay(addr.debtToken, amount, 2, address(this));
       }
     }
     emit SwapCompleted(completedType, amount);
@@ -340,7 +341,12 @@ contract CarryStrategy is Ownable, ReentrancyGuard {
     uint256 tradeSize = _min(_notionalBase, execution.maxTradeSize);
     if (_notionalBase > execution.maxTradeSize) twapLeverageRatio = leverage.target;
     uint256 debtToBorrow = _calculateDebtBorrowAmount(tradeSize);
-    uint256 maxBorrow = IZaibots(addr.zaibots).getMaxBorrow(address(this), addr.debtToken);
+    uint256 maxBorrow;
+    {
+      (, , uint256 availBorrowBase, , , ) = IPool(addr.zaibots).getUserAccountData(address(this));
+      (, int256 _mbPrice, , , ) = IChainlinkAggregatorV3(addr.jpyUsdOracle != address(0) ? addr.jpyUsdOracle : addr.jpyUsdAggregator).latestRoundData();
+      maxBorrow = uint256(_mbPrice) > 0 ? (availBorrowBase * 1e18) / uint256(_mbPrice) : 0;
+    }
     maxBorrow = (maxBorrow * 95) / 100;
     bool wasCapped = false;
     if (debtToBorrow > maxBorrow) {
@@ -369,7 +375,7 @@ contract CarryStrategy is Ownable, ReentrancyGuard {
         }
       }
     }
-    IZaibots(addr.zaibots).borrow(addr.debtToken, debtToBorrow, address(this));
+    IPool(addr.zaibots).borrow(addr.debtToken, debtToBorrow, 2, 0, address(this));
     // Calculate expected output: JPY→USDC, with 2x slippage buffer
     pendingSwapExpectedOutput = uint128(_calculateExpectedLeverOutput(debtToBorrow));
     bytes memory priceCheckerData = abi.encode(execution.slippageBps, addr.priceChecker);
@@ -389,7 +395,7 @@ contract CarryStrategy is Ownable, ReentrancyGuard {
   function _deleverWithSlippage(uint256 _notionalBase, uint16 _slippageBps) internal {
     if (_notionalBase == 0) return;
     uint256 tradeSize = _min(_notionalBase, execution.maxTradeSize);
-    IZaibots(addr.zaibots).withdraw(addr.collateralToken, tradeSize, address(this));
+    IPool(addr.zaibots).withdraw(addr.collateralToken, tradeSize, address(this));
     // Calculate expected output: USDC→JPY, with 2x slippage buffer
     pendingSwapExpectedOutput = uint128(_calculateExpectedDeleverOutput(tradeSize));
     bytes memory priceCheckerData = abi.encode(_slippageBps, addr.priceChecker);
@@ -401,11 +407,11 @@ contract CarryStrategy is Ownable, ReentrancyGuard {
   }
 
   function _getCollateralBalance() internal view returns (uint256) {
-    return IZaibots(addr.zaibots).getCollateralBalance(address(this), addr.collateralToken);
+    return IERC20(IPool(addr.zaibots).getReserveAToken(addr.collateralToken)).balanceOf(address(this));
   }
 
   function _getDebtBalance() internal view returns (uint256) {
-    return IZaibots(addr.zaibots).getDebtBalance(address(this), addr.debtToken);
+    return IERC20(IPool(addr.zaibots).getReserveVariableDebtToken(addr.debtToken)).balanceOf(address(this));
   }
 
   function _getDebtBalanceInBase() internal view returns (uint256) {
@@ -424,7 +430,9 @@ contract CarryStrategy is Ownable, ReentrancyGuard {
   }
 
   function _getLTV() internal view returns (uint256) {
-    return IZaibots(addr.zaibots).getLTV(addr.collateralToken, addr.debtToken);
+    DataTypes.ReserveConfigurationMap memory config = IPool(addr.zaibots).getConfiguration(addr.collateralToken);
+    uint256 ltvBps = config.data & 0xFFFF;
+    return (ltvBps * 1e18) / 10000;
   }
 
   function _calculateDebtBorrowAmount(uint256 baseAmount) internal view returns (uint256) {
@@ -465,11 +473,16 @@ contract CarryStrategy is Ownable, ReentrancyGuard {
 
   function _validateLeverageParams(uint64 target, uint64 maxLev) internal view {
     if (addr.zaibots == address(0) || addr.zaibots == address(1)) return;
-    uint256 ltv = IZaibots(addr.zaibots).getLTV(addr.collateralToken, addr.debtToken);
-    if (ltv == 0 || ltv >= FULL_PRECISION) return;
-    uint256 complement = FULL_PRECISION - ltv;
-    if (uint256(target) * complement >= 1e27) revert LeverageExceedsLTVLimit();
-    if (uint256(maxLev) * complement >= 1e27) revert LeverageExceedsLTVLimit();
+    try IPool(addr.zaibots).getConfiguration(addr.collateralToken) returns (DataTypes.ReserveConfigurationMap memory config) {
+      uint256 ltvBps = config.data & 0xFFFF;
+      uint256 ltv = (ltvBps * 1e18) / 10000;
+      if (ltv == 0 || ltv >= FULL_PRECISION) return;
+      uint256 complement = FULL_PRECISION - ltv;
+      if (uint256(target) * complement >= 1e27) revert LeverageExceedsLTVLimit();
+      if (uint256(maxLev) * complement >= 1e27) revert LeverageExceedsLTVLimit();
+    } catch {
+      return;
+    }
   }
 
   /// @notice Expected USDC output from selling jpyAmount of debt token (lever: JPY→USDC)

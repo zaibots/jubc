@@ -7,7 +7,7 @@ import {IERC20} from "openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
 import {MockERC20} from "../../../lib/TestUtils.sol";
 import {MockChainlinkFeed} from "../mocks/MockChainlinkFeed.sol";
 import {MockMilkman} from "../mocks/MockMilkman.sol";
-import {MockZaibots} from "../mocks/MockZaibots.sol";
+import {MockAavePool} from "../mocks/MockAavePool.sol";
 
 import {CarryStrategy} from "custom/products/carryUSDC/CarryStrategy.sol";
 import {CarryAdapter} from "custom/integrations/morpho/adapters/CarryAdapter.sol";
@@ -28,7 +28,7 @@ contract CarryHandler is Test {
     CarryAdapter public adapter;
     LinearBlockTwapOracle public oracle;
     CarryKeeper public keeper;
-    MockZaibots public zaibots;
+    MockAavePool public zaibots;
     MockMilkman public milkman;
     MockChainlinkFeed public priceFeed;
     MockERC20 public usdc;
@@ -78,7 +78,7 @@ contract CarryHandler is Test {
         CarryAdapter _adapter,
         LinearBlockTwapOracle _oracle,
         CarryKeeper _keeper,
-        MockZaibots _zaibots,
+        MockAavePool _zaibots,
         MockMilkman _milkman,
         MockChainlinkFeed _priceFeed,
         MockERC20 _usdc,

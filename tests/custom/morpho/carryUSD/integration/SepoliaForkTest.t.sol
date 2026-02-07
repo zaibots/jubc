@@ -11,236 +11,17 @@ import {IPoolAddressesProvider} from "aave-v3-origin/contracts/interfaces/IPoolA
 import {DataTypes} from "aave-v3-origin/contracts/protocol/libraries/types/DataTypes.sol";
 import {IPoolConfigurator} from "aave-v3-origin/contracts/interfaces/IPoolConfigurator.sol";
 
-import {IZaibots} from "custom/integrations/morpho/interfaces/IZaibots.sol";
 import {CarryStrategy} from "custom/products/carryUSDC/CarryStrategy.sol";
 import {CarryAdapter} from "custom/integrations/morpho/adapters/CarryAdapter.sol";
 import {LinearBlockTwapOracle} from "custom/products/carryUSDC/LinearBlockTwapOracle.sol";
 import {CarryTwapPriceChecker} from "custom/products/carryUSDC/CarryTwapPriceChecker.sol";
 
+import {VaultV2} from "vault-v2/VaultV2.sol";
+import {VaultV2Factory} from "vault-v2/VaultV2Factory.sol";
+import {IVaultV2} from "vault-v2/interfaces/IVaultV2.sol";
+
 import {MockChainlinkFeed} from "../mocks/MockChainlinkFeed.sol";
 import {MockMilkman} from "../mocks/MockMilkman.sol";
-import {MockMorphoVault} from "../mocks/MockMorphoVault.sol";
-
-// ═══════════════════════════════════════════════════════════════════
-// ZaibotsAaveAdapter: IZaibots wrapper around real Aave V3 IPool
-// ═══════════════════════════════════════════════════════════════════
-
-contract ZaibotsAaveAdapter is IZaibots {
-    using SafeERC20 for IERC20;
-
-    IPool public immutable pool;
-    IPoolAddressesProvider public immutable addressesProvider;
-
-    constructor(address _pool, address _addressesProvider) {
-        pool = IPool(_pool);
-        addressesProvider = IPoolAddressesProvider(_addressesProvider);
-    }
-
-    function supply(address asset, uint256 amount, address onBehalfOf) external override returns (uint256) {
-        IERC20(asset).safeTransferFrom(msg.sender, address(this), amount);
-        IERC20(asset).forceApprove(address(pool), amount);
-        pool.supply(asset, amount, onBehalfOf, 0);
-        return amount;
-    }
-
-    function withdraw(address asset, uint256 amount, address to) external override returns (uint256) {
-        // The caller (strategy) must have aTokens. We need to pull aTokens or use delegation.
-        // For fork test, the strategy is the onBehalfOf, so aTokens are in the strategy.
-        // We can't directly withdraw on behalf of someone else in Aave V3 without delegation.
-        // The strategy calls withdraw through this adapter, so we need the strategy to
-        // transfer aTokens to us first, or use the Pool's withdraw which checks msg.sender.
-        // Actually, Aave's withdraw checks that msg.sender owns the aTokens or has allowance.
-        // Since strategy called us, and aTokens are in strategy's balance, we need strategy
-        // to have approved the aTokens to us.
-        //
-        // Simpler approach: have the strategy call pool.withdraw directly through this adapter.
-        // But the pool checks msg.sender's aToken balance. So this adapter needs to hold the aTokens.
-        // Let's have supply() credit aTokens to this adapter, and track per-user.
-        //
-        // Actually, in supply() above we do: pool.supply(asset, amount, onBehalfOf, 0)
-        // This means aTokens go to onBehalfOf (the strategy). So the strategy has the aTokens.
-        // When strategy calls withdraw through us, the pool will check OUR (adapter) aToken balance
-        // since WE are msg.sender to pool.withdraw().
-        //
-        // Fix: supply should set onBehalfOf to address(this) and we track internally.
-        // But that changes the architecture...
-        //
-        // Simplest for fork test: supply to address(this), track balances manually.
-        // BUT that means we're the ones with aTokens.
-        //
-        // Let me re-think: The strategy calls IZaibots(adapter).withdraw().
-        // The adapter calls pool.withdraw() where msg.sender is the adapter.
-        // So the adapter needs to hold the aTokens.
-        //
-        // Let's fix supply to send aTokens to this adapter contract.
-        // Actually supply() already does pool.supply(asset, amount, onBehalfOf, 0).
-        // We need it to be pool.supply(asset, amount, address(this), 0) so WE hold the aTokens.
-
-        // For withdraw: pool.withdraw sends underlying to `to`.
-        uint256 withdrawn = pool.withdraw(asset, amount, to);
-        return withdrawn;
-    }
-
-    function borrow(address asset, uint256 amount, address onBehalfOf) external override {
-        // Variable rate = 2
-        pool.borrow(asset, amount, 2, 0, onBehalfOf);
-        // After borrow, tokens are sent to msg.sender (this adapter), forward to caller
-        IERC20(asset).safeTransfer(msg.sender, amount);
-    }
-
-    function repay(address asset, uint256 amount, address onBehalfOf) external override returns (uint256) {
-        IERC20(asset).safeTransferFrom(msg.sender, address(this), amount);
-        IERC20(asset).forceApprove(address(pool), amount);
-        return pool.repay(asset, amount, 2, onBehalfOf);
-    }
-
-    function getCollateralBalance(address user, address asset) external view override returns (uint256) {
-        DataTypes.ReserveDataLegacy memory reserve = pool.getReserveData(asset);
-        return IERC20(reserve.aTokenAddress).balanceOf(user);
-    }
-
-    function getDebtBalance(address user, address asset) external view override returns (uint256) {
-        DataTypes.ReserveDataLegacy memory reserve = pool.getReserveData(asset);
-        return IERC20(reserve.variableDebtTokenAddress).balanceOf(user);
-    }
-
-    function getLTV(address collateral, address /* debt */) external view override returns (uint256) {
-        DataTypes.ReserveDataLegacy memory reserve = pool.getReserveData(collateral);
-        // ReserveConfiguration stores LTV in first 16 bits (in bps)
-        uint256 configData = reserve.configuration.data;
-        uint256 ltvBps = configData & 0xFFFF; // first 16 bits
-        // Convert from bps (e.g., 7500 = 75%) to 18-decimal (0.75e18)
-        return (ltvBps * 1e18) / 10000;
-    }
-
-    function getBorrowRate(address asset) external view override returns (uint256) {
-        DataTypes.ReserveDataLegacy memory reserve = pool.getReserveData(asset);
-        return reserve.currentVariableBorrowRate;
-    }
-
-    function getSupplyRate(address asset) external view override returns (uint256) {
-        DataTypes.ReserveDataLegacy memory reserve = pool.getReserveData(asset);
-        return reserve.currentLiquidityRate;
-    }
-
-    function isLiquidatable(address user) external view override returns (bool) {
-        (, , , , , uint256 healthFactor) = pool.getUserAccountData(user);
-        return healthFactor < 1e18;
-    }
-
-    function getHealthFactor(address user) external view override returns (uint256) {
-        (, , , , , uint256 healthFactor) = pool.getUserAccountData(user);
-        return healthFactor;
-    }
-
-    function getMaxBorrow(address user, address /* asset */) external view override returns (uint256) {
-        (, , uint256 availableBorrows, , , ) = pool.getUserAccountData(user);
-        return availableBorrows;
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════
-// ZaibotsAaveAdapterSelf: variant that holds aTokens/debt itself
-// ═══════════════════════════════════════════════════════════════════
-
-/**
- * @title ZaibotsAaveAdapterSelf
- * @notice IZaibots adapter that holds aTokens itself and tracks per-user balances.
- *         This is needed because Aave's withdraw() checks msg.sender's aToken balance.
- */
-contract ZaibotsAaveAdapterSelf is IZaibots {
-    using SafeERC20 for IERC20;
-
-    IPool public immutable pool;
-
-    // Track collateral per user per asset
-    mapping(address => mapping(address => uint256)) public userCollateral;
-
-    constructor(address _pool) {
-        pool = IPool(_pool);
-    }
-
-    function supply(address asset, uint256 amount, address onBehalfOf) external override returns (uint256) {
-        IERC20(asset).safeTransferFrom(msg.sender, address(this), amount);
-        IERC20(asset).forceApprove(address(pool), amount);
-        // Supply to self so we hold the aTokens
-        pool.supply(asset, amount, address(this), 0);
-        userCollateral[onBehalfOf][asset] += amount;
-        return amount;
-    }
-
-    function withdraw(address asset, uint256 amount, address to) external override returns (uint256) {
-        // msg.sender is the strategy
-        uint256 available = userCollateral[msg.sender][asset];
-        uint256 toWithdraw = amount > available ? available : amount;
-        userCollateral[msg.sender][asset] -= toWithdraw;
-        // We hold the aTokens, so pool.withdraw checks our balance
-        uint256 withdrawn = pool.withdraw(asset, toWithdraw, to);
-        return withdrawn;
-    }
-
-    function borrow(address asset, uint256 amount, address onBehalfOf) external override {
-        // Borrow on behalf of this adapter (we hold the collateral)
-        // The debt goes to address(this), tokens sent to address(this)
-        pool.borrow(asset, amount, 2, 0, address(this));
-        // Forward borrowed tokens to the caller (strategy)
-        IERC20(asset).safeTransfer(msg.sender, amount);
-    }
-
-    function repay(address asset, uint256 amount, address onBehalfOf) external override returns (uint256) {
-        IERC20(asset).safeTransferFrom(msg.sender, address(this), amount);
-        IERC20(asset).forceApprove(address(pool), amount);
-        // Repay our own debt
-        return pool.repay(asset, amount, 2, address(this));
-    }
-
-    function getCollateralBalance(address user, address asset) external view override returns (uint256) {
-        return userCollateral[user][asset];
-    }
-
-    function getDebtBalance(address /* user */, address asset) external view override returns (uint256) {
-        // All debt is held by this adapter (address(this)), so return our debt token balance
-        DataTypes.ReserveDataLegacy memory reserve = pool.getReserveData(asset);
-        return IERC20(reserve.variableDebtTokenAddress).balanceOf(address(this));
-    }
-
-    function getLTV(address collateral, address /* debt */) external view override returns (uint256) {
-        DataTypes.ReserveDataLegacy memory reserve = pool.getReserveData(collateral);
-        uint256 configData = reserve.configuration.data;
-        uint256 ltvBps = configData & 0xFFFF;
-        return (ltvBps * 1e18) / 10000;
-    }
-
-    function getBorrowRate(address asset) external view override returns (uint256) {
-        DataTypes.ReserveDataLegacy memory reserve = pool.getReserveData(asset);
-        return reserve.currentVariableBorrowRate;
-    }
-
-    function getSupplyRate(address asset) external view override returns (uint256) {
-        DataTypes.ReserveDataLegacy memory reserve = pool.getReserveData(asset);
-        return reserve.currentLiquidityRate;
-    }
-
-    function isLiquidatable(address /* user */) external view override returns (bool) {
-        (, , , , , uint256 healthFactor) = pool.getUserAccountData(address(this));
-        return healthFactor < 1e18;
-    }
-
-    function getHealthFactor(address /* user */) external view override returns (uint256) {
-        (, , , , , uint256 healthFactor) = pool.getUserAccountData(address(this));
-        return healthFactor;
-    }
-
-    function getMaxBorrow(address /* user */, address asset) external view override returns (uint256) {
-        (, , uint256 availableBorrowsBase, , , ) = pool.getUserAccountData(address(this));
-        if (availableBorrowsBase == 0) return 0;
-        // Convert from base currency (USD, 8 dec) to asset units (18 dec for AIEN)
-        address oracleAddr = IPoolAddressesProvider(pool.ADDRESSES_PROVIDER()).getPriceOracle();
-        uint256 assetPrice = IAaveOracle(oracleAddr).getAssetPrice(asset);
-        if (assetPrice == 0) return 0;
-        return (availableBorrowsBase * 1e18) / assetPrice;
-    }
-}
 
 // ═══════════════════════════════════════════════════════════════════
 // Fork Test
@@ -297,7 +78,6 @@ contract SepoliaForkTest is Test {
 
     IPool public pool;
     IAaveOracle public oracle;
-    ZaibotsAaveAdapterSelf public zaibots;
 
     IERC20 public usdc;
     IERC20 public aien;
@@ -308,8 +88,9 @@ contract SepoliaForkTest is Test {
     CarryTwapPriceChecker public priceChecker;
     MockChainlinkFeed public mockAienUsdFeed;
     MockMilkman public mockMilkman;
-    MockMorphoVault public morphoVault;
-    address public aienDebtToken; // Set from pool reserve data in setUp
+    VaultV2 public morphoVault;
+    address public usdcAToken;
+    address public aienDebtToken;
 
     address public owner = makeAddr("owner");
     address public keeper = makeAddr("keeper");
@@ -330,7 +111,9 @@ contract SepoliaForkTest is Test {
         usdc = IERC20(USDC);
         aien = IERC20(AIEN);
 
-        // Read actual AIEN debt token from pool reserve data
+        // Read actual token addresses from pool reserve data
+        DataTypes.ReserveDataLegacy memory usdcReserve = pool.getReserveData(USDC);
+        usdcAToken = usdcReserve.aTokenAddress;
         DataTypes.ReserveDataLegacy memory aienReserve = pool.getReserveData(AIEN);
         aienDebtToken = aienReserve.variableDebtTokenAddress;
 
@@ -341,9 +124,6 @@ contract SepoliaForkTest is Test {
         vm.stopPrank();
 
         vm.startPrank(owner);
-
-        // Deploy ZaibotsAaveAdapter (wraps real Aave pool)
-        zaibots = new ZaibotsAaveAdapterSelf(POOL);
 
         // Deploy mocks for swap simulation and oracle
         mockAienUsdFeed = new MockChainlinkFeed(8, "AIEN / USD", AIEN_USD_PRICE);
@@ -360,10 +140,10 @@ contract SepoliaForkTest is Test {
             AIEN
         );
 
-        // Deploy carry strategy
+        // Deploy carry strategy - uses real Aave Pool directly
         CarryStrategy.Addresses memory stratAddrs = CarryStrategy.Addresses({
             adapter: address(0),  // Set after adapter deployment
-            zaibots: address(zaibots),
+            zaibots: POOL,        // Direct Aave V3 Pool
             collateralToken: USDC,
             debtToken: AIEN,
             jpyUsdOracle: address(mockAienUsdFeed),
@@ -397,8 +177,12 @@ contract SepoliaForkTest is Test {
             incParams
         );
 
-        // Deploy Morpho vault
-        morphoVault = new MockMorphoVault(usdc, "CarryUSD Vault", "cvUSD");
+        // Deploy real VaultV2 via factory
+        {
+            VaultV2Factory factory = new VaultV2Factory();
+            address vaultAddr = factory.createVaultV2(owner, USDC, bytes32("carry-sepolia"));
+            morphoVault = VaultV2(vaultAddr);
+        }
 
         // Deploy carry adapter (connects vault to strategy)
         carryAdapter = new CarryAdapter(
@@ -411,7 +195,18 @@ contract SepoliaForkTest is Test {
         // Wire up
         carryAdapter.setStrategy(address(carryStrategy));
         carryStrategy.setAdapter(address(carryAdapter));
+
+        // Configure VaultV2: curator, adapter, allocator, caps
+        morphoVault.setCurator(owner);
+        morphoVault.submit(abi.encodeCall(IVaultV2.addAdapter, (address(carryAdapter))));
         morphoVault.addAdapter(address(carryAdapter));
+        morphoVault.submit(abi.encodeCall(IVaultV2.setIsAllocator, (owner, true)));
+        morphoVault.setIsAllocator(owner, true);
+        // Set caps for adapter risk IDs
+        uint256 maxCap = uint256(type(uint128).max);
+        _setVaultCap(bytes("aave-protocol"), maxCap);
+        _setVaultCap(bytes("jpy-fx-exposure"), maxCap);
+        _setVaultCap(abi.encodePacked("strategy:", "aggressive-usdc-aien"), maxCap);
 
         // Set permissions
         carryStrategy.setOperator(keeper);
@@ -443,11 +238,35 @@ contract SepoliaForkTest is Test {
         vm.label(POOL, "AavePool");
         vm.label(USDC, "USDC");
         vm.label(AIEN, "AIEN");
-        vm.label(address(zaibots), "ZaibotsAdapter");
         vm.label(address(carryStrategy), "CarryStrategy");
         vm.label(address(carryAdapter), "CarryAdapter");
         vm.label(address(morphoVault), "MorphoVault");
         vm.label(address(mockMilkman), "MockMilkman");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // AAVE POOL HELPER FUNCTIONS
+    // ═══════════════════════════════════════════════════════════════════
+
+    function _getCollateralBalance(address user, address asset) internal view returns (uint256) {
+        DataTypes.ReserveDataLegacy memory reserve = pool.getReserveData(asset);
+        return IERC20(reserve.aTokenAddress).balanceOf(user);
+    }
+
+    function _getDebtBalance(address user, address asset) internal view returns (uint256) {
+        DataTypes.ReserveDataLegacy memory reserve = pool.getReserveData(asset);
+        return IERC20(reserve.variableDebtTokenAddress).balanceOf(user);
+    }
+
+    function _getLTV(address asset) internal view returns (uint256) {
+        DataTypes.ReserveConfigurationMap memory config = pool.getConfiguration(asset);
+        uint256 ltvBps = config.data & 0xFFFF;
+        return (ltvBps * 1e18) / 10000;
+    }
+
+    function _getHealthFactor(address user) internal view returns (uint256) {
+        (, , , , , uint256 hf) = pool.getUserAccountData(user);
+        return hf;
     }
 
     // ═══════════════════════════════════════════════════════════════════
@@ -514,9 +333,7 @@ contract SepoliaForkTest is Test {
         pool.supply(USDC, amount, alice, 0);
         vm.stopPrank();
 
-        DataTypes.ReserveDataLegacy memory reserve = pool.getReserveData(USDC);
-        uint256 aTokenBal = IERC20(reserve.aTokenAddress).balanceOf(alice);
-
+        uint256 aTokenBal = IERC20(usdcAToken).balanceOf(alice);
         console2.log("Alice aUSDC balance after supply:", aTokenBal);
         assertGe(aTokenBal, amount - 1, "Should have aTokens");
     }
@@ -552,58 +369,8 @@ contract SepoliaForkTest is Test {
         vm.stopPrank();
     }
 
-    // ═══════════════════════════════════════════════════════════════════
-    // ZAIBOTS ADAPTER TESTS
-    // ═══════════════════════════════════════════════════════════════════
-
-    function test_fork_zaibotsSupply() public {
-        uint256 amount = 100_000e6;
-
-        vm.startPrank(alice);
-        usdc.approve(address(zaibots), amount);
-        zaibots.supply(USDC, amount, alice);
-        vm.stopPrank();
-
-        uint256 collateral = zaibots.getCollateralBalance(alice, USDC);
-        console2.log("Zaibots collateral balance:", collateral);
-        assertEq(collateral, amount, "Collateral should match supply");
-    }
-
-    function test_fork_zaibotsSupplyAndBorrow() public {
-        uint256 supplyAmount = 1_000_000e6;
-
-        vm.startPrank(alice);
-        usdc.approve(address(zaibots), supplyAmount);
-        zaibots.supply(USDC, supplyAmount, alice);
-
-        // Check health
-        uint256 hf = zaibots.getHealthFactor(alice);
-        console2.log("Health factor after supply:", hf);
-
-        // Calculate borrow amount
-        uint256 ltv = zaibots.getLTV(USDC, AIEN);
-        console2.log("LTV (18 dec):", ltv);
-
-        // Borrow a small amount of AIEN
-        uint256 aienPrice = oracle.getAssetPrice(AIEN);
-        uint256 borrowValueBase = (supplyAmount * 1e2 * ltv) / (10 * 1e18); // Convert to base units (8 dec)
-        uint256 borrowAmount = (borrowValueBase * 1e18) / aienPrice;
-        borrowAmount = borrowAmount / 10; // Be conservative, borrow 10% of max
-
-        console2.log("Attempting to borrow AIEN:", borrowAmount);
-
-        if (borrowAmount > 0) {
-            zaibots.borrow(AIEN, borrowAmount, alice);
-
-            uint256 aienBalance = aien.balanceOf(alice);
-            console2.log("AIEN balance after borrow:", aienBalance);
-            assertTrue(aienBalance >= borrowAmount, "Should have received borrowed AIEN");
-        }
-        vm.stopPrank();
-    }
-
-    function test_fork_zaibotsLTV() public view {
-        uint256 ltv = zaibots.getLTV(USDC, AIEN);
+    function test_fork_poolLTV() public view {
+        uint256 ltv = _getLTV(USDC);
         console2.log("USDC LTV (18 dec):", ltv);
         assertTrue(ltv > 0, "LTV should be > 0");
         assertTrue(ltv <= 1e18, "LTV should be <= 100%");
@@ -625,8 +392,9 @@ contract SepoliaForkTest is Test {
         console2.log("Vault total assets:", morphoVault.totalAssets());
         console2.log("Alice share balance:", morphoVault.balanceOf(alice));
 
-        assertEq(shares, depositAmount, "First deposit should be 1:1");
-        assertEq(morphoVault.totalAssets(), depositAmount, "Total assets should match deposit");
+        assertTrue(shares > 0, "Should mint shares");
+        // VaultV2 has 1 virtual asset, so totalAssets = depositAmount + 1
+        assertGe(morphoVault.totalAssets(), depositAmount, "Total assets should be >= deposit");
     }
 
     function test_fork_vaultMultiDeposit() public {
@@ -648,9 +416,9 @@ contract SepoliaForkTest is Test {
         console2.log("Vault total assets:", morphoVault.totalAssets());
         console2.log("Alice shares:", morphoVault.balanceOf(alice));
         console2.log("Bob shares:", morphoVault.balanceOf(bob));
-        console2.log("Share price (18 dec):", morphoVault.sharePrice());
 
-        assertEq(morphoVault.totalAssets(), aliceDeposit + bobDeposit, "Total assets should be sum of deposits");
+        // VaultV2 has 1 virtual asset
+        assertGe(morphoVault.totalAssets(), aliceDeposit + bobDeposit, "Total assets should be >= sum of deposits");
     }
 
     // ═══════════════════════════════════════════════════════════════════
@@ -681,8 +449,8 @@ contract SepoliaForkTest is Test {
         console2.log("Adapter real assets:", carryAdapter.realAssets());
         console2.log("Strategy real assets:", carryStrategy.getRealAssets());
 
-        // Strategy should now have collateral in Aave pool via zaibots
-        uint256 collateral = zaibots.getCollateralBalance(address(carryStrategy), USDC);
+        // Strategy should now have collateral in Aave pool directly
+        uint256 collateral = _getCollateralBalance(address(carryStrategy), USDC);
         console2.log("Strategy collateral in pool:", collateral);
 
         assertEq(collateral, allocateAmount, "Strategy collateral should match allocation");
@@ -707,7 +475,7 @@ contract SepoliaForkTest is Test {
         morphoVault.allocate(address(carryAdapter), "", allocateAmount);
 
         console2.log("=== Step 2: Allocated to strategy ===");
-        console2.log("Strategy collateral:", zaibots.getCollateralBalance(address(carryStrategy), USDC));
+        console2.log("Strategy collateral:", _getCollateralBalance(address(carryStrategy), USDC));
         console2.log("Strategy leverage:", carryStrategy.getCurrentLeverageRatio());
 
         // Step 3: Engage strategy (initiate leverage)
@@ -732,9 +500,6 @@ contract SepoliaForkTest is Test {
         console2.log("=== Step 4: Swap settled ===");
         console2.log("Strategy USDC in hand:", usdc.balanceOf(address(carryStrategy)));
 
-        // The strategy should now have received USDC back from the swap
-        // It needs to be supplied to the pool - but the current flow expects
-        // tokens to auto-supply. Let's check the state.
         console2.log("Swap state after settle:", uint256(carryStrategy.swapState()));
     }
 
@@ -813,8 +578,6 @@ contract SepoliaForkTest is Test {
     function test_fork_usdcAsCollateralEnabled() public view {
         DataTypes.ReserveDataLegacy memory reserve = pool.getReserveData(USDC);
 
-        // Check if USDC can be used as collateral (bit 56 in v3.6 = isActive, bit 57 = isFrozen)
-        // LTV > 0 means it can be used as collateral
         uint256 ltv = reserve.configuration.data & 0xFFFF;
         assertTrue(ltv > 0, "USDC should have LTV > 0 (can be collateral)");
 
@@ -834,8 +597,11 @@ contract SepoliaForkTest is Test {
         morphoVault.deposit(1_000_000e6, alice);
         vm.stopPrank();
 
-        uint256 sharePrice1 = morphoVault.sharePrice();
-        console2.log("Share price after Alice deposit:", sharePrice1);
+        // VaultV2 convertToAssets gives us the price per share
+        uint256 aliceShares = morphoVault.balanceOf(alice);
+        uint256 aliceValue = morphoVault.convertToAssets(aliceShares);
+        console2.log("Alice shares:", aliceShares);
+        console2.log("Alice value (USDC):", aliceValue);
 
         // Bob deposits 500k
         vm.startPrank(bob);
@@ -843,18 +609,18 @@ contract SepoliaForkTest is Test {
         morphoVault.deposit(500_000e6, bob);
         vm.stopPrank();
 
-        uint256 sharePrice2 = morphoVault.sharePrice();
-        console2.log("Share price after Bob deposit:", sharePrice2);
-
-        // Share price should remain 1:1 since no yield has accrued
-        assertEq(sharePrice1, 1e18, "Initial share price should be 1.0");
-        assertEq(sharePrice2, 1e18, "Share price should still be 1.0");
-
-        // Verify proportional shares
-        uint256 aliceShares = morphoVault.balanceOf(alice);
         uint256 bobShares = morphoVault.balanceOf(bob);
-        assertEq(aliceShares, 1_000_000e6, "Alice should have proportional shares");
-        assertEq(bobShares, 500_000e6, "Bob should have proportional shares");
+        uint256 bobValue = morphoVault.convertToAssets(bobShares);
+        console2.log("Bob shares:", bobShares);
+        console2.log("Bob value (USDC):", bobValue);
+
+        // Verify proportional shares: Alice deposited 2x Bob, should have ~2x shares
+        assertTrue(aliceShares > 0, "Alice should have shares");
+        assertTrue(bobShares > 0, "Bob should have shares");
+        // Allow small rounding difference
+        uint256 ratio = (aliceShares * 1000) / bobShares;
+        assertGe(ratio, 1990, "Alice should have ~2x Bob's shares");
+        assertLe(ratio, 2010, "Alice should have ~2x Bob's shares");
     }
 
     // ═══════════════════════════════════════════════════════════════════
@@ -864,7 +630,7 @@ contract SepoliaForkTest is Test {
     /**
      * @notice Tests iterative supply→borrow→swap→supply loop at the pool level
      * @dev Simulates what the strategy does across multiple TWAP iterations
-     *      to achieve 7x leverage. Uses the ZaibotsAaveAdapter against the real pool.
+     *      to achieve 7x leverage. Uses the real Aave pool directly.
      *      Swap is simulated with deal() since we're testing pool mechanics, not DEX routing.
      */
     function test_fork_iterativeLeverageLoop_toTarget() public {
@@ -895,18 +661,18 @@ contract SepoliaForkTest is Test {
         console2.log("USDC price (8 dec):", usdcPrice);
         console2.log("AIEN price (8 dec):", aienPrice);
 
-        // Supply initial USDC through zaibots adapter
+        // Supply initial USDC directly to pool
         deal(USDC, address(this), initialCollateral);
-        usdc.approve(address(zaibots), initialCollateral);
-        zaibots.supply(USDC, initialCollateral, address(this));
+        usdc.approve(address(pool), initialCollateral);
+        pool.supply(USDC, initialCollateral, address(this), 0);
 
         uint256 iteration = 0;
         uint256 maxIterations = 20;
 
         while (iteration < maxIterations) {
-            // Get current state from the adapter
-            uint256 collateral = zaibots.getCollateralBalance(address(this), USDC);
-            uint256 debtAien = IERC20(aienDebtToken).balanceOf(address(zaibots));
+            // Get current state directly from pool
+            uint256 collateral = _getCollateralBalance(address(this), USDC);
+            uint256 debtAien = _getDebtBalance(address(this), AIEN);
 
             // Convert debt to USDC-equivalent (base units)
             // debtAien is in 18 dec, aienPrice in 8 dec, usdcPrice in 8 dec
@@ -955,7 +721,7 @@ contract SepoliaForkTest is Test {
             }
 
             // Check health factor allows this borrow
-            (, , uint256 availableBorrowsBase, , , ) = pool.getUserAccountData(address(zaibots));
+            (, , uint256 availableBorrowsBase, , , ) = pool.getUserAccountData(address(this));
             uint256 borrowValueBase = (borrowAmountAien * aienPrice) / 1e18; // 8 dec base units
             if (borrowValueBase > availableBorrowsBase) {
                 // Reduce borrow to fit within available
@@ -970,31 +736,30 @@ contract SepoliaForkTest is Test {
 
             console2.log("  Borrowing:", borrowAmountAien / 1e18, "AIEN");
 
-            // Borrow AIEN through zaibots adapter
-            zaibots.borrow(AIEN, borrowAmountAien, address(this));
+            // Borrow AIEN directly from pool
+            pool.borrow(AIEN, borrowAmountAien, 2, 0, address(this));
 
             // Simulate swap: AIEN -> USDC
-            // In production this goes through Milkman/CoW. Here we simulate the output.
             uint256 usdcReceived = (borrowAmountAien * aienPrice) / (usdcPrice * 1e12);
             deal(USDC, address(this), usdcReceived);
 
             console2.log("  Swap output:", usdcReceived / 1e6, "USDC");
 
             // Supply the received USDC back as additional collateral
-            usdc.approve(address(zaibots), usdcReceived);
-            zaibots.supply(USDC, usdcReceived, address(this));
+            usdc.approve(address(pool), usdcReceived);
+            pool.supply(USDC, usdcReceived, address(this), 0);
 
             iteration++;
         }
 
         // Final state
-        uint256 finalCollateral = zaibots.getCollateralBalance(address(this), USDC);
-        uint256 finalDebtAien = IERC20(aienDebtToken).balanceOf(address(zaibots));
+        uint256 finalCollateral = _getCollateralBalance(address(this), USDC);
+        uint256 finalDebtAien = _getDebtBalance(address(this), AIEN);
         uint256 finalDebtUsdc = finalDebtAien > 0 ? (finalDebtAien * aienPrice) / (usdcPrice * 1e12) : 0;
         uint256 finalEquity = finalCollateral > finalDebtUsdc ? finalCollateral - finalDebtUsdc : 0;
         uint256 finalLeverage = finalEquity > 0 ? (finalCollateral * 1e18) / finalEquity : 1e18;
 
-        (, , , , , uint256 finalHF) = pool.getUserAccountData(address(zaibots));
+        (, , , , , uint256 finalHF) = pool.getUserAccountData(address(this));
 
         console2.log("=== FINAL STATE ===");
         console2.log("Collateral:", finalCollateral / 1e6, "USDC");
@@ -1089,11 +854,11 @@ contract SepoliaForkTest is Test {
 
             // Check leverage after this iteration
             uint256 currentLev = carryStrategy.getCurrentLeverageRatio();
-            uint256 collateral = zaibots.getCollateralBalance(address(carryStrategy), USDC);
-            uint256 debtAien = zaibots.getDebtBalance(address(carryStrategy), AIEN);
-            uint256 aienPrice = oracle.getAssetPrice(AIEN);
-            uint256 usdcPrice = oracle.getAssetPrice(USDC);
-            uint256 debtUsdc = debtAien > 0 ? (debtAien * aienPrice) / (usdcPrice * 1e12) : 0;
+            uint256 collateral = _getCollateralBalance(address(carryStrategy), USDC);
+            uint256 debtAien = _getDebtBalance(address(carryStrategy), AIEN);
+            uint256 _aienPrice = oracle.getAssetPrice(AIEN);
+            uint256 _usdcPrice = oracle.getAssetPrice(USDC);
+            uint256 debtUsdc = debtAien > 0 ? (debtAien * _aienPrice) / (_usdcPrice * 1e12) : 0;
 
             console2.log("  [iter", iteration, "] -------------------------------------------");
             console2.log("    Swap settled:  +", usdcReceived / 1e6, "USDC");
@@ -1146,7 +911,7 @@ contract SepoliaForkTest is Test {
 
         // Assertions
         uint256 finalLev = carryStrategy.getCurrentLeverageRatio();
-        (, , , , , uint256 hf) = pool.getUserAccountData(address(zaibots));
+        (, , , , , uint256 hf) = pool.getUserAccountData(address(carryStrategy));
         assertTrue(finalLev > 2e18, "Should be leveraged above 2x");
         assertTrue(hf > 1e18, "Health factor should be > 1 (not liquidatable)");
         assertTrue(iteration > 1, "Should have completed multiple iterations");
@@ -1157,18 +922,18 @@ contract SepoliaForkTest is Test {
     // ═══════════════════════════════════════════════════════════════════
 
     function _printVaultDashboard(uint256 initialDeposit, uint256 iterations) internal view {
-        uint256 collateral = zaibots.getCollateralBalance(address(carryStrategy), USDC);
-        uint256 debtAien = zaibots.getDebtBalance(address(carryStrategy), AIEN);
+        uint256 collateral = _getCollateralBalance(address(carryStrategy), USDC);
+        uint256 debtAien = _getDebtBalance(address(carryStrategy), AIEN);
         uint256 aienPrice = oracle.getAssetPrice(AIEN);
         uint256 usdcPrice = oracle.getAssetPrice(USDC);
         uint256 debtUsdc = debtAien > 0 ? (debtAien * aienPrice) / (usdcPrice * 1e12) : 0;
         uint256 equity = collateral > debtUsdc ? collateral - debtUsdc : 0;
         uint256 currentLev = equity > 0 ? (collateral * 1e18) / equity : 1e18;
 
-        uint256 ltv = zaibots.getLTV(USDC, AIEN);
+        uint256 ltv = _getLTV(USDC);
         uint256 maxTheoreticalLev = ltv < 1e18 ? (1e18 * 1e18) / (1e18 - ltv) : type(uint256).max;
         uint256 safeMaxLev = (maxTheoreticalLev * 95) / 100;
-        (, , , , , uint256 hf) = pool.getUserAccountData(address(zaibots));
+        (, , , , , uint256 hf) = pool.getUserAccountData(address(carryStrategy));
 
         // Calculate LTV utilization
         uint256 ltvUsedPct = collateral > 0 ? (debtUsdc * 10000) / collateral : 0;
@@ -1185,23 +950,8 @@ contract SepoliaForkTest is Test {
         // Liquidation threshold from reserve config
         DataTypes.ReserveDataLegacy memory usdcReserve = pool.getReserveData(USDC);
         uint256 liqThresholdBps = (usdcReserve.configuration.data >> 16) & 0xFFFF;
-        // Price drop % to trigger liquidation
-        // HF = (collateral * liqThreshold) / debt. HF < 1 when collateral * liqThreshold < debt
-        // If AIEN price drops, debt (in USDC) decreases — so it's AIEN price RISE that hurts
-        // Actually: we borrow AIEN, so if AIEN rises relative to USDC, our debt grows
-        // Liquidation when: collateral * liqThreshold/10000 < debtUsdc_at_new_price
-        // debtUsdc_at_new_price = debtAien * (aienPrice * (1+x)) / (usdcPrice * 1e12)
-        // Solve: collateral * liqThreshold/10000 = debtAien * aienPrice * (1+x) / (usdcPrice * 1e12)
-        // (1+x) = collateral * liqThreshold * usdcPrice * 1e12 / (10000 * debtAien * aienPrice)
-        uint256 liqPriceMultiplier = 0;
         uint256 aienPriceAtLiq = 0;
         if (debtAien > 0 && aienPrice > 0) {
-            // How much AIEN price can rise before liquidation
-            liqPriceMultiplier = (collateral * liqThresholdBps * usdcPrice * 1e12) / (10000 * debtAien * aienPrice);
-            // liqPriceMultiplier is in 1e6 terms (since collateral is 6 dec)
-            // Actually let me redo this more carefully:
-            // collateral (6 dec) * liqThreshold/10000 = debtAien (18 dec) * newAienPrice (8 dec) / (usdcPrice (8 dec) * 1e12)
-            // newAienPrice = collateral * liqThreshold * usdcPrice * 1e12 / (10000 * debtAien)
             aienPriceAtLiq = (collateral * liqThresholdBps * usdcPrice * 1e12) / (10000 * debtAien);
         }
 
@@ -1265,16 +1015,12 @@ contract SepoliaForkTest is Test {
     }
 
     function _printLeverageBar(uint256 current, uint256 target, uint256 maxTheo) internal pure {
-        // Build a 20-char bar showing current leverage position
-        // Scale: 0 = 1x, 20 = maxTheo
         uint256 range = maxTheo > 1e18 ? maxTheo - 1e18 : 1;
         uint256 currentPos = current > 1e18 ? ((current - 1e18) * 20) / range : 0;
         uint256 targetPos = target > 1e18 ? ((target - 1e18) * 20) / range : 0;
         if (currentPos > 20) currentPos = 20;
         if (targetPos > 20) targetPos = 20;
 
-        // Log positions for visualization
-        // Using simple markers: = for filled, . for empty, T for target
         bytes memory bar = new bytes(22);
         bar[0] = "[";
         bar[21] = "]";
@@ -1292,46 +1038,23 @@ contract SepoliaForkTest is Test {
 
     /**
      * @notice Reset CarryStrategy swapState to IDLE and clear pending fields
-     * @dev Uses vm.store to poke the packed storage slot.
-     *      The layout of slot containing swapState:
-     *      [swapState(1 byte) | twapLeverageRatio(8) | lastRebalanceTs(8) | lastTradeTs(8)]
-     *      We preserve twapLeverageRatio and timestamps, just clear swapState.
-     *      Also clears pendingSwapTs and pendingSwapAmount in the next slot.
      */
     function _resetSwapState() internal {
-        // Find the storage slot of swapState by reading current packed value.
-        // CarryStrategy storage layout after inherited Ownable(1 slot) + ReentrancyGuard(1 slot):
-        // slot 2: string name
-        // slot 3: StrategyType strategyType
-        // slots 4-12: Addresses addr (9 addresses)
-        // slot 13: LeverageParams (4x uint64 = 32 bytes)
-        // slots 14-15: ExecutionParams (uint128+uint32+uint16+uint32+uint64 = 34 bytes)
-        // slot 16: IncentiveParams (uint16+uint16+uint128+uint96 = 32 bytes)
-        // slot 17: swapState(uint8) + twapLeverageRatio(uint64) + lastRebalanceTs(uint64) + lastTradeTs(uint64)
-        // slot 18: pendingSwapTs(uint64) + pendingSwapAmount(uint128)
-
-        // Read slot 17
         bytes32 slot17 = vm.load(address(carryStrategy), bytes32(uint256(17)));
-
-        // Clear the lowest byte (swapState) - set to 0 (IDLE)
-        // Keep everything else (twapLeverageRatio, timestamps)
         bytes32 clearedSlot17 = slot17 & ~bytes32(uint256(0xFF));
         vm.store(address(carryStrategy), bytes32(uint256(17)), clearedSlot17);
-
-        // Clear slot 18 (pendingSwapTs + pendingSwapAmount)
         vm.store(address(carryStrategy), bytes32(uint256(18)), bytes32(0));
-        // Clear slot 19 (pendingSwapExpectedOutput — added in Phase 3)
         vm.store(address(carryStrategy), bytes32(uint256(19)), bytes32(0));
     }
 
-    /**
-     * @notice Clear twapLeverageRatio in storage so shouldRebalance() doesn't return ITERATE/NONE
-     * @dev twapLeverageRatio is bits 8-71 of slot 17 (uint64 packed after uint8 swapState)
-     */
     function _clearTwapLeverageRatio() internal {
         bytes32 slot17 = vm.load(address(carryStrategy), bytes32(uint256(17)));
-        // Mask to clear bits 8-71 (twapLeverageRatio), preserve everything else
         bytes32 mask = ~bytes32(uint256(0xFFFFFFFFFFFFFFFF) << 8);
         vm.store(address(carryStrategy), bytes32(uint256(17)), slot17 & mask);
+    }
+
+    function _setVaultCap(bytes memory idData, uint256 cap) internal {
+        morphoVault.submit(abi.encodeCall(IVaultV2.increaseAbsoluteCap, (idData, cap)));
+        morphoVault.increaseAbsoluteCap(idData, cap);
     }
 }

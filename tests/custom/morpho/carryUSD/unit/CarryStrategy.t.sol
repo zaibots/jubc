@@ -398,7 +398,7 @@ contract CarryStrategyTest is TestCarryUSDBase {
         vm.prank(keeper, keeper);
         carryStrategy.engage();
 
-        uint256 collateralBefore = mockZaibots.getCollateralBalance(address(carryStrategy), address(usdc));
+        uint256 collateralBefore = mockPool.getCollateralBalance(address(carryStrategy), address(usdc));
 
         // Settle milkman swap (tokens go to strategy)
         bytes32 swapId = mockMilkman.getLatestSwapId();
@@ -410,7 +410,7 @@ contract CarryStrategyTest is TestCarryUSDBase {
         assertEq(uint256(carryStrategy.swapState()), uint256(CarryStrategy.SwapState.IDLE), "Should reset to IDLE");
         assertEq(carryStrategy.pendingSwapAmount(), 0, "Should reset pending amount");
         assertEq(carryStrategy.pendingSwapTs(), 0, "Should reset pending timestamp");
-        assertGt(mockZaibots.getCollateralBalance(address(carryStrategy), address(usdc)), collateralBefore, "Collateral should increase");
+        assertGt(mockPool.getCollateralBalance(address(carryStrategy), address(usdc)), collateralBefore, "Collateral should increase");
     }
 
     function test_completeSwap_delever_repaysDebt() public onlyLocal {
@@ -429,7 +429,7 @@ contract CarryStrategyTest is TestCarryUSDBase {
 
             assertEq(uint256(carryStrategy.swapState()), uint256(CarryStrategy.SwapState.PENDING_DELEVER_SWAP), "Should be pending delever");
 
-            uint256 debtBefore = mockZaibots.getDebtBalance(address(carryStrategy), address(jUBC));
+            uint256 debtBefore = mockPool.getDebtBalance(address(carryStrategy), address(jUBC));
 
             // Settle and complete
             bytes32 swapId = mockMilkman.getLatestSwapId();
@@ -437,7 +437,7 @@ contract CarryStrategyTest is TestCarryUSDBase {
             carryStrategy.completeSwap();
 
             assertEq(uint256(carryStrategy.swapState()), uint256(CarryStrategy.SwapState.IDLE), "Should reset to IDLE");
-            assertLe(mockZaibots.getDebtBalance(address(carryStrategy), address(jUBC)), debtBefore, "Debt should decrease or stay");
+            assertLe(mockPool.getDebtBalance(address(carryStrategy), address(jUBC)), debtBefore, "Debt should decrease or stay");
         }
     }
 
@@ -616,7 +616,7 @@ contract CarryStrategyTest is TestCarryUSDBase {
         // 10_000_000_000 * (1e18 - 0.75e18) = 10e9 * 0.25e18 = 2.5e27 >= 1e27 → revert
         CarryStrategy.Addresses memory addrs = CarryStrategy.Addresses({
             adapter: address(0),
-            zaibots: address(mockZaibots),
+            zaibots: address(mockPool),
             collateralToken: address(usdc),
             debtToken: address(jUBC),
             jpyUsdOracle: address(mockJpyUsdFeed),
@@ -640,7 +640,7 @@ contract CarryStrategyTest is TestCarryUSDBase {
         // Conservative target 2.5x with 75% LTV: 2.5e9 * 0.25e18 = 0.625e27 < 1e27 → pass
         CarryStrategy.Addresses memory addrs = CarryStrategy.Addresses({
             adapter: address(0),
-            zaibots: address(mockZaibots),
+            zaibots: address(mockPool),
             collateralToken: address(usdc),
             debtToken: address(jUBC),
             jpyUsdOracle: address(mockJpyUsdFeed),
@@ -665,7 +665,7 @@ contract CarryStrategyTest is TestCarryUSDBase {
         // At exactly the limit: target * complement == 1e27 → should revert (>= check)
         CarryStrategy.Addresses memory addrs = CarryStrategy.Addresses({
             adapter: address(0),
-            zaibots: address(mockZaibots),
+            zaibots: address(mockPool),
             collateralToken: address(usdc),
             debtToken: address(jUBC),
             jpyUsdOracle: address(mockJpyUsdFeed),
@@ -699,7 +699,7 @@ contract CarryStrategyTest is TestCarryUSDBase {
 
     function test_syncLTV_deactivatesWhenLTVDrops() public onlyLocal {
         // Drop LTV to 50% → max leverage = 2x, but target = 2.5x → invalid
-        mockZaibots.setLTV(address(usdc), address(jUBC), 0.50e18);
+        mockPool.setLTV(address(usdc), address(jUBC), 0.50e18);
 
         vm.expectEmit(true, true, true, true);
         emit CarryStrategy.StrategyAutoDeactivated("LTV no longer supports target leverage");
@@ -711,7 +711,7 @@ contract CarryStrategyTest is TestCarryUSDBase {
 
     function test_syncLTV_remainsActiveWhenLTVIncreases() public onlyLocal {
         // Increase LTV to 85% → max leverage ~6.67x >> 2.5x target
-        mockZaibots.setLTV(address(usdc), address(jUBC), 0.85e18);
+        mockPool.setLTV(address(usdc), address(jUBC), 0.85e18);
 
         bool valid = carryStrategy.syncLTV();
         assertTrue(valid, "Should be valid with higher LTV");
@@ -726,7 +726,7 @@ contract CarryStrategyTest is TestCarryUSDBase {
     }
 
     function test_syncLTV_idempotentWhenAlreadyDeactivated() public onlyLocal {
-        mockZaibots.setLTV(address(usdc), address(jUBC), 0.50e18);
+        mockPool.setLTV(address(usdc), address(jUBC), 0.50e18);
 
         carryStrategy.syncLTV();
         assertFalse(carryStrategy.isActive(), "Should be deactivated");
@@ -740,7 +740,7 @@ contract CarryStrategyTest is TestCarryUSDBase {
     function test_isLTVValid_viewFunction() public onlyLocal {
         assertTrue(carryStrategy.isLTVValid(), "Should be valid initially");
 
-        mockZaibots.setLTV(address(usdc), address(jUBC), 0.50e18);
+        mockPool.setLTV(address(usdc), address(jUBC), 0.50e18);
 
         assertFalse(carryStrategy.isLTVValid(), "View should return false after LTV drop");
         assertTrue(carryStrategy.isActive(), "View should not mutate isActive");
@@ -750,7 +750,7 @@ contract CarryStrategyTest is TestCarryUSDBase {
         _setupCollateral(100_000e6);
 
         // Drop LTV and sync → deactivates
-        mockZaibots.setLTV(address(usdc), address(jUBC), 0.50e18);
+        mockPool.setLTV(address(usdc), address(jUBC), 0.50e18);
         carryStrategy.syncLTV();
 
         vm.prank(keeper, keeper);
@@ -762,7 +762,7 @@ contract CarryStrategyTest is TestCarryUSDBase {
         _setupCollateral(100_000e6);
 
         // Drop LTV but do NOT call syncLTV — engage's inline check should catch it
-        mockZaibots.setLTV(address(usdc), address(jUBC), 0.50e18);
+        mockPool.setLTV(address(usdc), address(jUBC), 0.50e18);
 
         vm.prank(keeper, keeper);
         vm.expectRevert(CarryStrategy.LeverageExceedsLTVLimit.selector);
@@ -781,7 +781,7 @@ contract CarryStrategyTest is TestCarryUSDBase {
         _completeLeverSwap();
 
         // Set tiny max borrow so iterations are constrained
-        mockZaibots.setMaxBorrow(address(carryStrategy), 100e18); // Tiny borrow cap
+        mockPool.setMaxBorrow(address(carryStrategy), 100e18); // Tiny borrow cap
 
         _warpPastTwapCooldown();
 
@@ -804,7 +804,7 @@ contract CarryStrategyTest is TestCarryUSDBase {
         _completeLeverSwap();
 
         // Set zero borrow capacity
-        mockZaibots.setMaxBorrow(address(carryStrategy), 0);
+        mockPool.setMaxBorrow(address(carryStrategy), 0);
 
         _warpPastTwapCooldown();
 
@@ -829,7 +829,7 @@ contract CarryStrategyTest is TestCarryUSDBase {
         _completeLeverSwap();
 
         // Clear override so full borrow is available
-        mockZaibots.clearMaxBorrowOverride(address(carryStrategy));
+        mockPool.clearMaxBorrowOverride(address(carryStrategy));
 
         // Complete remaining TWAP iterations
         uint256 iterations = 0;
@@ -857,7 +857,7 @@ contract CarryStrategyTest is TestCarryUSDBase {
         _completeLeverSwap();
 
         // Constrained period — tiny borrow cap
-        mockZaibots.setMaxBorrow(address(carryStrategy), 50e18);
+        mockPool.setMaxBorrow(address(carryStrategy), 50e18);
 
         _warpPastTwapCooldown();
 
@@ -874,7 +874,7 @@ contract CarryStrategyTest is TestCarryUSDBase {
             assertTrue(carryStrategy.twapLeverageRatio() > 0, "TWAP should persist during constrained period");
 
             // Restore capacity
-            mockZaibots.clearMaxBorrowOverride(address(carryStrategy));
+            mockPool.clearMaxBorrowOverride(address(carryStrategy));
 
             _warpPastTwapCooldown();
 
@@ -898,7 +898,7 @@ contract CarryStrategyTest is TestCarryUSDBase {
         _setupCollateral(100_000e6);
 
         // Set a very low max borrow so the cap kicks in
-        mockZaibots.setMaxBorrow(address(carryStrategy), 1_000e18);
+        mockPool.setMaxBorrow(address(carryStrategy), 1_000e18);
 
         vm.prank(keeper, keeper);
         carryStrategy.engage();
@@ -915,7 +915,7 @@ contract CarryStrategyTest is TestCarryUSDBase {
         _setupCollateral(100_000e6);
 
         // Set zero max borrow — strategy should return early without creating swap
-        mockZaibots.setMaxBorrow(address(carryStrategy), 1); // After 95% safety: 0
+        mockPool.setMaxBorrow(address(carryStrategy), 1); // After 95% safety: 0
 
         vm.prank(keeper, keeper);
         carryStrategy.engage();
@@ -1061,13 +1061,13 @@ contract CarryStrategyTest is TestCarryUSDBase {
     }
 
     function test_getMaxAchievableLeverage_50pctLTV() public onlyLocal {
-        mockZaibots.setLTV(address(usdc), address(jUBC), 0.50e18);
+        mockPool.setLTV(address(usdc), address(jUBC), 0.50e18);
         uint256 maxLev = carryStrategy.getMaxAchievableLeverage();
         assertEq(maxLev, 2e18, "50% LTV should give 2x max leverage");
     }
 
     function test_getMaxAchievableLeverage_90pctLTV() public onlyLocal {
-        mockZaibots.setLTV(address(usdc), address(jUBC), 0.90e18);
+        mockPool.setLTV(address(usdc), address(jUBC), 0.90e18);
         uint256 maxLev = carryStrategy.getMaxAchievableLeverage();
         assertEq(maxLev, 10e18, "90% LTV should give 10x max leverage");
     }
@@ -1093,7 +1093,7 @@ contract CarryStrategyTest is TestCarryUSDBase {
         // Safe max = 4x * 0.95 = 3.8x, so 3.9x target gets capped to 3.8x
         CarryStrategy.Addresses memory addrs = CarryStrategy.Addresses({
             adapter: address(0),
-            zaibots: address(mockZaibots),
+            zaibots: address(mockPool),
             collateralToken: address(usdc),
             debtToken: address(jUBC),
             jpyUsdOracle: address(mockJpyUsdFeed),
@@ -1118,7 +1118,7 @@ contract CarryStrategyTest is TestCarryUSDBase {
         // Fund and supply collateral
         mockUsdc.mint(address(highStrategy), 100_000e6);
         vm.prank(address(highStrategy));
-        mockZaibots.supply(address(usdc), 100_000e6, address(highStrategy));
+        mockPool.supply(address(usdc), 100_000e6, address(highStrategy));
 
         vm.prank(keeper, keeper);
         highStrategy.engage();
@@ -1141,11 +1141,11 @@ contract CarryStrategyTest is TestCarryUSDBase {
 
         // After engage, verify debt doesn't exceed safe leverage bounds
         if (carryStrategy.swapState() == CarryStrategy.SwapState.PENDING_LEVER_SWAP) {
-            uint256 debt = mockZaibots.getDebtBalance(address(carryStrategy), address(jUBC));
-            uint256 collateral = mockZaibots.getCollateralBalance(address(carryStrategy), address(usdc));
+            uint256 debt = mockPool.getDebtBalance(address(carryStrategy), address(jUBC));
+            uint256 collateral = mockPool.getCollateralBalance(address(carryStrategy), address(usdc));
             (, int256 price, , , ) = mockJpyUsdFeed.latestRoundData();
             uint256 debtInBase = (debt * uint256(price)) / 1e20;
-            uint256 ltv = mockZaibots.getLTV(address(usdc), address(jUBC));
+            uint256 ltv = mockPool.getLTV(address(usdc), address(jUBC));
             uint256 maxDebt = (collateral * ltv) / 1e18;
 
             assertTrue(debtInBase <= maxDebt + 1e6, "Debt should not exceed LTV limit");
@@ -1160,11 +1160,11 @@ contract CarryStrategyTest is TestCarryUSDBase {
         carryStrategy.engage();
 
         if (carryStrategy.swapState() == CarryStrategy.SwapState.PENDING_LEVER_SWAP) {
-            uint256 debt = mockZaibots.getDebtBalance(address(carryStrategy), address(jUBC));
-            uint256 collateral = mockZaibots.getCollateralBalance(address(carryStrategy), address(usdc));
+            uint256 debt = mockPool.getDebtBalance(address(carryStrategy), address(jUBC));
+            uint256 collateral = mockPool.getCollateralBalance(address(carryStrategy), address(usdc));
             (, int256 price, , , ) = mockJpyUsdFeed.latestRoundData();
             uint256 debtInBase = (debt * uint256(price)) / 1e20;
-            uint256 ltv = mockZaibots.getLTV(address(usdc), address(jUBC));
+            uint256 ltv = mockPool.getLTV(address(usdc), address(jUBC));
             uint256 maxDebt = (collateral * ltv) / 1e18;
 
             assertTrue(debtInBase <= maxDebt + 1e6, "Small collateral debt should respect LTV");
@@ -1211,11 +1211,11 @@ contract CarryStrategyTest is TestCarryUSDBase {
         carryStrategy.engage();
 
         if (carryStrategy.swapState() == CarryStrategy.SwapState.PENDING_LEVER_SWAP) {
-            uint256 debt = mockZaibots.getDebtBalance(address(carryStrategy), address(jUBC));
-            uint256 collateral = mockZaibots.getCollateralBalance(address(carryStrategy), address(usdc));
+            uint256 debt = mockPool.getDebtBalance(address(carryStrategy), address(jUBC));
+            uint256 collateral = mockPool.getCollateralBalance(address(carryStrategy), address(usdc));
             (, int256 price, , , ) = mockJpyUsdFeed.latestRoundData();
             uint256 debtInBase = (debt * uint256(price)) / 1e20;
-            uint256 ltv = mockZaibots.getLTV(address(usdc), address(jUBC));
+            uint256 ltv = mockPool.getLTV(address(usdc), address(jUBC));
             uint256 maxDebt = (collateral * ltv) / 1e18;
 
             // Allow 1% tolerance for rounding
@@ -1324,7 +1324,7 @@ contract CarryStrategyTest is TestCarryUSDBase {
         mockUsdc.mint(address(carryStrategy), amount);
         // Note: Don't call approve here - the strategy constructor already approved max to zaibots
         vm.prank(address(carryStrategy));
-        mockZaibots.supply(address(usdc), amount, address(carryStrategy));
+        mockPool.supply(address(usdc), amount, address(carryStrategy));
     }
 
     function _setupEngagedStrategy(uint256 amount) internal {

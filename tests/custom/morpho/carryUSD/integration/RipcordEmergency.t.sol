@@ -296,7 +296,7 @@ contract RipcordEmergencyTest is TestCarryUSDBase {
         mockUsdc.mint(address(carryStrategy), amount);
         // Note: Don't call approve here - the strategy constructor already approved max to zaibots
         vm.prank(address(carryStrategy));
-        mockZaibots.supply(address(usdc), amount, address(carryStrategy));
+        mockPool.supply(address(usdc), amount, address(carryStrategy));
 
         _engageStrategy();
         _completeLeverSwap();

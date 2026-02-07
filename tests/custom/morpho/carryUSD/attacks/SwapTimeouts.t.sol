@@ -13,7 +13,7 @@ contract SwapTimeoutsTest is TestCarryUSDBase {
     function _setupPendingSwap() internal {
         mockUsdc.mint(address(carryStrategy), 100_000e6);
         vm.prank(address(carryStrategy));
-        mockZaibots.supply(address(usdc), 100_000e6, address(carryStrategy));
+        mockPool.supply(address(usdc), 100_000e6, address(carryStrategy));
         vm.prank(keeper, keeper);
         carryStrategy.engage();
     }

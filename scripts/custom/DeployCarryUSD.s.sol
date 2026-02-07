@@ -6,6 +6,11 @@ import {IERC20} from 'openzeppelin-contracts/contracts/token/ERC20/IERC20.sol';
 import {ERC20} from 'openzeppelin-contracts/contracts/token/ERC20/ERC20.sol';
 import {SafeERC20} from 'openzeppelin-contracts/contracts/token/ERC20/utils/SafeERC20.sol';
 
+// Morpho Vault V2
+import {VaultV2} from 'vault-v2/VaultV2.sol';
+import {VaultV2Factory} from 'vault-v2/VaultV2Factory.sol';
+import {IVaultV2} from 'vault-v2/interfaces/IVaultV2.sol';
+
 // CarryUSD Product Contracts
 import {CarryStrategy} from 'custom/products/carryUSDC/CarryStrategy.sol';
 import {CarryAdapter} from 'custom/integrations/morpho/adapters/CarryAdapter.sol';
@@ -15,7 +20,6 @@ import {CarryKeeper} from 'custom/products/carryUSDC/CarryKeeper.sol';
 
 // Interfaces for mocks
 import {IChainlinkAggregatorV3} from 'custom/integrations/morpho/interfaces/IChainlinkAutomation.sol';
-import {IZaibots} from 'custom/integrations/morpho/interfaces/IZaibots.sol';
 
 // Network address library
 import {NetworkAddresses} from './config/MarketConfig.sol';
@@ -189,11 +193,14 @@ contract DeployCarryUSD is Script {
   CarryKeeper public carryKeeper;
 
   // Mock contracts (only deployed if needed)
-  DeployMockZaibots public mockZaibots;
-  DeployMockMorphoVault public mockMorphoVault;
+  DeployMockPool public mockPool;
   DeployMockMilkman public mockMilkman;
   DeployMockChainlinkFeed public mockJpyUsdFeed;
   DeployMockChainlinkFeed public mockUsdcUsdFeed;
+
+  // Vault V2 (deployed via VaultV2Factory when no vault address provided)
+  VaultV2 public morphoVaultV2;
+  bool public deployedNewVault;
 
   // Configuration
   CarryUSDConfig.Network public network;
@@ -252,6 +259,7 @@ contract DeployCarryUSD is Script {
       collateralToken: addresses.usdc,
       debtToken: addresses.jpyToken,
       jpyUsdOracle: addresses.jpyUsdFeed,
+      jpyUsdAggregator: addresses.jpyUsdFeed,
       twapOracle: address(twapOracle),
       milkman: addresses.milkman,
       priceChecker: address(priceChecker)
@@ -306,9 +314,9 @@ contract DeployCarryUSD is Script {
       console2.log('  Ownership transferred to admin');
     }
 
-    if (deployedMocks && address(mockMorphoVault) != address(0)) {
-      mockMorphoVault.addAdapter(address(carryAdapter));
-      console2.log('  Adapter registered with mock Morpho vault');
+    if (deployedNewVault && address(morphoVaultV2) != address(0)) {
+      _configureVaultV2();
+      console2.log('  VaultV2 configured: adapter, allocator, caps set');
     }
 
     vm.stopBroadcast();
@@ -344,6 +352,12 @@ contract DeployCarryUSD is Script {
     } else {
       strategyParams = CarryUSDConfig.getModerateStrategy();
     }
+
+    // Custom leverage overrides (9 decimal precision, e.g. 7000000000 = 7x)
+    strategyParams.targetLeverage = uint64(vm.envOr('TARGET_LEVERAGE', uint256(strategyParams.targetLeverage)));
+    strategyParams.minLeverage = uint64(vm.envOr('MIN_LEVERAGE', uint256(strategyParams.minLeverage)));
+    strategyParams.maxLeverage = uint64(vm.envOr('MAX_LEVERAGE', uint256(strategyParams.maxLeverage)));
+    strategyParams.ripcordLeverage = uint64(vm.envOr('RIPCORD_LEVERAGE', uint256(strategyParams.ripcordLeverage)));
 
     admin = vm.envOr('ADMIN', msg.sender);
     keeper = vm.envOr('KEEPER', msg.sender);
@@ -383,19 +397,22 @@ contract DeployCarryUSD is Script {
     }
 
     if (addresses.morphoVault == address(0)) {
-      console2.log('  Deploying MockMorphoVault...');
-      mockMorphoVault = new DeployMockMorphoVault(IERC20(addresses.usdc), 'Mock CarryUSD Vault', 'mvCARRY');
-      addresses.morphoVault = address(mockMorphoVault);
-      console2.log('    MockMorphoVault:', addresses.morphoVault);
+      console2.log('  Deploying VaultV2 via VaultV2Factory...');
+      VaultV2Factory factory = new VaultV2Factory();
+      addresses.morphoVault = factory.createVaultV2(msg.sender, addresses.usdc, bytes32('CarryUSD'));
+      morphoVaultV2 = VaultV2(addresses.morphoVault);
+      deployedNewVault = true;
+      console2.log('    VaultV2:', addresses.morphoVault);
       deployedMocks = true;
     }
 
     if (addresses.aavePool == address(0)) {
-      console2.log('  Deploying MockZaibots...');
-      mockZaibots = new DeployMockZaibots();
-      mockZaibots.setLTV(addresses.usdc, addresses.jpyToken, 0.65e18);
-      addresses.aavePool = address(mockZaibots);
-      console2.log('    MockZaibots:', addresses.aavePool);
+      console2.log('  Deploying MockPool...');
+      mockPool = new DeployMockPool();
+      mockPool.registerAsset(addresses.usdc, 6500);
+      mockPool.registerAsset(addresses.jpyToken, 0);
+      addresses.aavePool = address(mockPool);
+      console2.log('    MockPool:', addresses.aavePool);
       deployedMocks = true;
     }
 
@@ -437,6 +454,39 @@ contract DeployCarryUSD is Script {
     return keccak256(bytes(a)) == keccak256(bytes(b));
   }
 
+  function _configureVaultV2() internal {
+    VaultV2 vault = morphoVaultV2;
+
+    // Set vault name and symbol (owner-only, no timelock)
+    vault.setName('CarryUSD Vault');
+    vault.setSymbol('cvUSD');
+
+    // Set deployer as curator (owner-only, no timelock)
+    vault.setCurator(msg.sender);
+
+    // All curator functions require submit+execute pattern.
+    // Fresh vaults have zero timelocks so execute is immediate after submit.
+
+    // Add adapter
+    vault.submit(abi.encodeCall(IVaultV2.addAdapter, (address(carryAdapter))));
+    vault.addAdapter(address(carryAdapter));
+
+    // Set deployer as allocator
+    vault.submit(abi.encodeCall(IVaultV2.setIsAllocator, (msg.sender, true)));
+    vault.setIsAllocator(msg.sender, true);
+
+    // Set caps for adapter risk IDs
+    _setAbsoluteCap(vault, bytes('aave-protocol'));
+    _setAbsoluteCap(vault, bytes('jpy-fx-exposure'));
+    _setAbsoluteCap(vault, abi.encodePacked('strategy:', _getStrategyId()));
+  }
+
+  function _setAbsoluteCap(VaultV2 vault, bytes memory idData) internal {
+    uint256 maxCap = uint256(type(uint128).max);
+    vault.submit(abi.encodeCall(IVaultV2.increaseAbsoluteCap, (idData, maxCap)));
+    vault.increaseAbsoluteCap(idData, maxCap);
+  }
+
   function _logDeployedAddresses() internal view {
     console2.log('');
     console2.log('========================================');
@@ -460,9 +510,9 @@ contract DeployCarryUSD is Script {
 
     if (deployedMocks) {
       console2.log('');
-      console2.log('--- Mock Contracts Deployed ---');
-      if (address(mockMorphoVault) != address(0)) console2.log('MockMorphoVault:', address(mockMorphoVault));
-      if (address(mockZaibots) != address(0)) console2.log('MockZaibots:', address(mockZaibots));
+      console2.log('--- Mock/Deployed Contracts ---');
+      if (deployedNewVault) console2.log('VaultV2:', address(morphoVaultV2));
+      if (address(mockPool) != address(0)) console2.log('MockPool:', address(mockPool));
       if (address(mockMilkman) != address(0)) console2.log('MockMilkman:', address(mockMilkman));
       if (address(mockJpyUsdFeed) != address(0)) console2.log('MockJpyUsdFeed:', address(mockJpyUsdFeed));
     }
@@ -567,111 +617,86 @@ contract DeployMockChainlinkFeed is IChainlinkAggregatorV3 {
   }
 }
 
-contract DeployMockZaibots is IZaibots {
+contract DeployMockBalanceTracker {
+  mapping(address => uint256) private _balances;
+
+  function balanceOf(address account) external view returns (uint256) {
+    return _balances[account];
+  }
+
+  function mint(address to, uint256 amount) external {
+    _balances[to] += amount;
+  }
+
+  function burn(address from, uint256 amount) external {
+    _balances[from] -= amount;
+  }
+}
+
+contract DeployMockPool {
   using SafeERC20 for IERC20;
 
-  mapping(address => mapping(address => uint256)) public collateralBalances;
-  mapping(address => mapping(address => uint256)) public debtBalances;
-  mapping(address => mapping(address => uint256)) public ltvRatios;
-
-  function setLTV(address collateral, address debt, uint256 ltv) external {
-    ltvRatios[collateral][debt] = ltv;
+  struct ReserveConfig {
+    uint256 data;
   }
 
-  function supply(address asset, uint256 amount, address onBehalfOf) external override returns (uint256) {
+  mapping(address => address) public aTokens;
+  mapping(address => address) public debtTokens;
+  mapping(address => uint256) public configData;
+
+  function registerAsset(address asset, uint256 ltvBps) external {
+    if (aTokens[asset] == address(0)) {
+      aTokens[asset] = address(new DeployMockBalanceTracker());
+      debtTokens[asset] = address(new DeployMockBalanceTracker());
+    }
+    configData[asset] = ltvBps;
+  }
+
+  function supply(address asset, uint256 amount, address onBehalfOf, uint16) external {
     IERC20(asset).safeTransferFrom(msg.sender, address(this), amount);
-    collateralBalances[onBehalfOf][asset] += amount;
-    return amount;
+    DeployMockBalanceTracker(aTokens[asset]).mint(onBehalfOf, amount);
   }
 
-  function withdraw(address asset, uint256 amount, address to) external override returns (uint256) {
-    uint256 balance = collateralBalances[msg.sender][asset];
-    uint256 toWithdraw = amount > balance ? balance : amount;
-    collateralBalances[msg.sender][asset] -= toWithdraw;
+  function withdraw(address asset, uint256 amount, address to) external returns (uint256) {
+    uint256 bal = DeployMockBalanceTracker(aTokens[asset]).balanceOf(msg.sender);
+    uint256 toWithdraw = amount > bal ? bal : amount;
+    DeployMockBalanceTracker(aTokens[asset]).burn(msg.sender, toWithdraw);
     IERC20(asset).safeTransfer(to, toWithdraw);
     return toWithdraw;
   }
 
-  function borrow(address asset, uint256 amount, address onBehalfOf) external override {
-    debtBalances[onBehalfOf][asset] += amount;
+  function borrow(address asset, uint256 amount, uint256, uint16, address onBehalfOf) external {
+    DeployMockBalanceTracker(debtTokens[asset]).mint(onBehalfOf, amount);
     IERC20(asset).safeTransfer(msg.sender, amount);
   }
 
-  function repay(address asset, uint256 amount, address onBehalfOf) external override returns (uint256) {
-    uint256 debt = debtBalances[onBehalfOf][asset];
+  function repay(address asset, uint256 amount, uint256, address onBehalfOf) external returns (uint256) {
+    uint256 debt = DeployMockBalanceTracker(debtTokens[asset]).balanceOf(onBehalfOf);
     uint256 toRepay = amount > debt ? debt : amount;
     IERC20(asset).safeTransferFrom(msg.sender, address(this), toRepay);
-    debtBalances[onBehalfOf][asset] -= toRepay;
+    DeployMockBalanceTracker(debtTokens[asset]).burn(onBehalfOf, toRepay);
     return toRepay;
   }
 
-  function getCollateralBalance(address user, address asset) external view override returns (uint256) {
-    return collateralBalances[user][asset];
+  function getConfiguration(address asset) external view returns (ReserveConfig memory) {
+    return ReserveConfig({data: configData[asset]});
   }
 
-  function getDebtBalance(address user, address asset) external view override returns (uint256) {
-    return debtBalances[user][asset];
+  function getReserveAToken(address asset) external view returns (address) {
+    return aTokens[asset];
   }
 
-  function getLTV(address collateral, address debt) external view override returns (uint256) {
-    uint256 ltv = ltvRatios[collateral][debt];
-    return ltv == 0 ? 0.65e18 : ltv;
+  function getReserveVariableDebtToken(address asset) external view returns (address) {
+    return debtTokens[asset];
   }
 
-  function getHealthFactor(address) external pure override returns (uint256) {
-    return 2e18;
-  }
-
-  function getBorrowRate(address) external pure override returns (uint256) {
-    return 0;
-  }
-
-  function getSupplyRate(address) external pure override returns (uint256) {
-    return 0;
-  }
-
-  function isLiquidatable(address) external pure override returns (bool) {
-    return false;
-  }
-
-  function getMaxBorrow(address user, address asset) external view override returns (uint256) {
-    return collateralBalances[user][asset] / 2;
+  function getUserAccountData(address) external pure returns (uint256, uint256, uint256, uint256, uint256, uint256) {
+    return (type(uint128).max, 0, type(uint128).max, 0, 0, type(uint128).max);
   }
 
   function fundBorrowLiquidity(address asset, uint256 amount) external {
     (bool success, ) = asset.call(abi.encodeWithSignature('mint(address,uint256)', address(this), amount));
     require(success, 'mint failed');
-  }
-}
-
-contract DeployMockMorphoVault is ERC20 {
-  IERC20 public immutable asset;
-  mapping(address => bool) public isAdapter;
-  mapping(address => uint256) public adapterAllocations;
-  address[] public adapters;
-
-  constructor(IERC20 _asset, string memory _name, string memory _symbol) ERC20(_name, _symbol) {
-    asset = _asset;
-  }
-
-  function addAdapter(address adapter) external {
-    require(!isAdapter[adapter], 'Already adapter');
-    isAdapter[adapter] = true;
-    adapters.push(adapter);
-  }
-
-  function deposit(uint256 assets, address receiver) external returns (uint256 shares) {
-    shares = totalSupply() == 0 ? assets : (assets * totalSupply()) / totalAssets();
-    asset.transferFrom(msg.sender, address(this), assets);
-    _mint(receiver, shares);
-  }
-
-  function totalAssets() public view returns (uint256) {
-    uint256 balance = asset.balanceOf(address(this));
-    for (uint256 i = 0; i < adapters.length; i++) {
-      balance += adapterAllocations[adapters[i]];
-    }
-    return balance;
   }
 }
 

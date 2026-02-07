@@ -208,7 +208,7 @@ contract CarryKeeperTest is TestCarryUSDBase {
         // Setup collateral and engage the strategy
         mockUsdc.mint(address(carryStrategy), 100_000e6);
         vm.prank(address(carryStrategy));
-        mockZaibots.supply(address(usdc), 100_000e6, address(carryStrategy));
+        mockPool.supply(address(usdc), 100_000e6, address(carryStrategy));
 
         vm.prank(keeper, keeper);
         carryStrategy.engage();
