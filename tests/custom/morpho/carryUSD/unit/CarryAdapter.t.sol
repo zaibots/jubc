@@ -91,11 +91,11 @@ contract CarryAdapterTest is TestCarryUSDBase {
         assertEq(riskIds.length, 3, "Should have 3 risk IDs");
 
         // Check for expected risks
-        bytes32 RISK_ID_ZAIBOTS = keccak256("zaibots-protocol");
+        bytes32 RISK_ID_AAVE = keccak256("aave-protocol");
         bytes32 RISK_ID_JPY_FX = keccak256("jpy-fx-exposure");
         bytes32 expectedStrategyRiskId = keccak256(abi.encodePacked("strategy:", "conservative-usdc"));
 
-        assertEq(riskIds[0], RISK_ID_ZAIBOTS, "First risk should be zaibots");
+        assertEq(riskIds[0], RISK_ID_AAVE, "First risk should be aave");
         assertEq(riskIds[1], RISK_ID_JPY_FX, "Second risk should be JPY FX");
         assertEq(riskIds[2], expectedStrategyRiskId, "Third risk should be strategy ID");
     }

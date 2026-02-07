@@ -33,7 +33,7 @@ contract InvariantCarryStrategyTest is TestCarryUSDBase {
             carryAdapter,
             twapOracle,
             carryKeeper,
-            mockZaibots,
+            mockPool,
             mockMilkman,
             mockJpyUsdFeed,
             mockUsdc,
@@ -75,7 +75,7 @@ contract InvariantCarryStrategyTest is TestCarryUSDBase {
         if (config.isForked) return;
 
         uint256 realAssets = carryStrategy.getRealAssets();
-        uint256 collateral = mockZaibots.getCollateralBalance(address(carryStrategy), address(usdc));
+        uint256 collateral = mockPool.getCollateralBalance(address(carryStrategy), address(usdc));
 
         assertTrue(realAssets <= collateral, "Real assets should not exceed collateral");
     }
@@ -148,12 +148,12 @@ contract InvariantCarryStrategyTest is TestCarryUSDBase {
         if (handler.ghost_cancelledSwaps() > 0) return;
         if (handler.ghost_cumulativePriceChange() != 0) return;
 
-        uint256 collateral = mockZaibots.getCollateralBalance(address(carryStrategy), address(usdc));
-        uint256 debt = mockZaibots.getDebtBalance(address(carryStrategy), address(jUBC));
+        uint256 collateral = mockPool.getCollateralBalance(address(carryStrategy), address(usdc));
+        uint256 debt = mockPool.getDebtBalance(address(carryStrategy), address(jUBC));
 
         if (collateral == 0 || debt == 0) return;
 
-        uint256 ltv = mockZaibots.getLTV(address(usdc), address(jUBC));
+        uint256 ltv = mockPool.getLTV(address(usdc), address(jUBC));
 
         // Convert debt to base terms
         (, int256 price, , , ) = mockJpyUsdFeed.latestRoundData();

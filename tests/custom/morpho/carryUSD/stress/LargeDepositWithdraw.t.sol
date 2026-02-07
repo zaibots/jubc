@@ -272,7 +272,7 @@ contract LargeDepositWithdrawTest is TestCarryUSDBase {
         mockUsdc.mint(address(carryStrategy), amount);
         // Note: Don't call approve here - the strategy constructor already approved max to zaibots
         vm.prank(address(carryStrategy));
-        mockZaibots.supply(address(usdc), amount, address(carryStrategy));
+        mockPool.supply(address(usdc), amount, address(carryStrategy));
     }
 
     function _setupEngagedStrategy(uint256 amount) internal {
@@ -297,7 +297,7 @@ contract LargeDepositWithdrawTest is TestCarryUSDBase {
     function _testDepositAndEngage(uint256 amount) internal {
         _setupCollateral(amount);
 
-        uint256 collateralBefore = mockZaibots.getCollateralBalance(address(carryStrategy), address(usdc));
+        uint256 collateralBefore = mockPool.getCollateralBalance(address(carryStrategy), address(usdc));
         assertTrue(collateralBefore > 0, "Should have collateral");
 
         _engageStrategy();

@@ -339,7 +339,7 @@ contract RebalanceScenariosTest is TestCarryUSDBase {
         }
 
         // Now constrain borrow capacity
-        mockZaibots.setMaxBorrow(address(carryStrategy), 50e18);
+        mockPool.setMaxBorrow(address(carryStrategy), 50e18);
 
         // Multiple constrained iterations
         for (uint256 i = 0; i < 3; i++) {
@@ -366,7 +366,7 @@ contract RebalanceScenariosTest is TestCarryUSDBase {
         _warpToRebalanceWindow();
 
         // Constrain borrow (shouldn't affect delever)
-        mockZaibots.setMaxBorrow(address(carryStrategy), 0);
+        mockPool.setMaxBorrow(address(carryStrategy), 0);
 
         CarryStrategy.ShouldRebalance action = carryStrategy.shouldRebalance();
         if (action == CarryStrategy.ShouldRebalance.REBALANCE || action == CarryStrategy.ShouldRebalance.RIPCORD) {
@@ -394,7 +394,7 @@ contract RebalanceScenariosTest is TestCarryUSDBase {
         mockUsdc.mint(address(carryStrategy), amount);
         // Note: Don't call approve here - the strategy constructor already approved max to zaibots
         vm.prank(address(carryStrategy));
-        mockZaibots.supply(address(usdc), amount, address(carryStrategy));
+        mockPool.supply(address(usdc), amount, address(carryStrategy));
 
         _engageStrategy();
         _completeLeverSwap();

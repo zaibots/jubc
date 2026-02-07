@@ -6,7 +6,7 @@ import {SafeERC20} from 'openzeppelin-contracts/contracts/token/ERC20/utils/Safe
 import {Ownable} from 'openzeppelin-contracts/contracts/access/Ownable.sol';
 import {ReentrancyGuard} from 'openzeppelin-contracts/contracts/utils/ReentrancyGuard.sol';
 
-import {IVaultV2Adapter} from '../interfaces/IVaultV2Adapter.sol';
+import {IAdapter} from 'vault-v2/interfaces/IAdapter.sol';
 
 interface ICarryStrategy {
   function receiveAssets(uint256 amount) external;
@@ -23,17 +23,19 @@ interface ILinearBlockTwapOracle {
 /**
  * @title CarryAdapter
  * @notice Morpho Vault V2 adapter for carry strategies
+ * @dev Implements IAdapter from vault-v2. VaultV2 pushes tokens before allocate()
+ *      and pulls tokens after deallocate() via safeTransferFrom.
  */
-contract CarryAdapter is IVaultV2Adapter, Ownable, ReentrancyGuard {
+contract CarryAdapter is IAdapter, Ownable, ReentrancyGuard {
   using SafeERC20 for IERC20;
 
-  address public immutable override vault;
-  address public immutable override asset;
+  address public immutable vault;
+  address public immutable asset;
   ICarryStrategy public strategy;
   ILinearBlockTwapOracle public twapOracle;
   bytes32 public immutable strategyRiskId;
 
-  bytes32 public constant RISK_ID_ZAIBOTS = keccak256('zaibots-protocol');
+  bytes32 public constant RISK_ID_AAVE = keccak256('aave-protocol');
   bytes32 public constant RISK_ID_JPY_FX = keccak256('jpy-fx-exposure');
 
   error OnlyVault();
@@ -54,24 +56,25 @@ contract CarryAdapter is IVaultV2Adapter, Ownable, ReentrancyGuard {
     twapOracle = ILinearBlockTwapOracle(_twapOracle);
   }
 
-  function allocate(bytes memory data, uint256 assets, bytes4, address) external override onlyVault nonReentrant returns (bytes32[] memory _ids, int256 delta) {
+  /// @dev VaultV2 pushes tokens to this adapter before calling allocate().
+  function allocate(bytes memory, uint256 assets, bytes4, address) external override onlyVault nonReentrant returns (bytes32[] memory _ids, int256 change) {
     if (address(strategy) == address(0)) revert StrategyNotSet();
-    IERC20(asset).safeTransferFrom(vault, address(this), assets);
+    // Tokens already at adapter — VaultV2 pushed before calling
     IERC20(asset).forceApprove(address(strategy), assets);
     strategy.receiveAssets(assets);
     _ids = ids();
-    delta = int256(assets);
-    emit Allocated(assets, data);
+    change = int256(assets);
   }
 
-  function deallocate(bytes memory data, uint256 assets, bytes4, address) external override onlyVault nonReentrant returns (bytes32[] memory _ids, int256 delta) {
+  /// @dev VaultV2 calls deallocate() then pulls tokens via safeTransferFrom.
+  function deallocate(bytes memory, uint256 assets, bytes4, address) external override onlyVault nonReentrant returns (bytes32[] memory _ids, int256 change) {
     if (address(strategy) == address(0)) revert StrategyNotSet();
     if (assets > realAssets()) revert InsufficientAssets();
     uint256 withdrawn = strategy.withdrawAssets(assets);
-    IERC20(asset).safeTransfer(vault, withdrawn);
+    // Approve vault to pull tokens after this call returns
+    IERC20(asset).forceApprove(vault, withdrawn);
     _ids = ids();
-    delta = -int256(withdrawn);
-    emit Deallocated(withdrawn, data);
+    change = -int256(withdrawn);
   }
 
   function realAssets() public view override returns (uint256) {
@@ -79,9 +82,9 @@ contract CarryAdapter is IVaultV2Adapter, Ownable, ReentrancyGuard {
     return strategy.getRealAssets();
   }
 
-  function ids() public view override returns (bytes32[] memory) {
+  function ids() public view returns (bytes32[] memory) {
     bytes32[] memory _ids = new bytes32[](3);
-    _ids[0] = RISK_ID_ZAIBOTS;
+    _ids[0] = RISK_ID_AAVE;
     _ids[1] = RISK_ID_JPY_FX;
     _ids[2] = strategyRiskId;
     return _ids;

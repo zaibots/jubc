@@ -7,6 +7,11 @@ import {IERC20} from "openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
 // Shared test utilities
 import {MockERC20, TestConstants, NetworkConfig} from "../../../lib/TestUtils.sol";
 
+// Morpho Vault V2
+import {VaultV2} from "vault-v2/VaultV2.sol";
+import {VaultV2Factory} from "vault-v2/VaultV2Factory.sol";
+import {IVaultV2} from "vault-v2/interfaces/IVaultV2.sol";
+
 // Aave V3 interfaces (for Zaibots)
 import {IPool} from "aave-v3-origin/contracts/interfaces/IPool.sol";
 import {IPoolAddressesProvider} from "aave-v3-origin/contracts/interfaces/IPoolAddressesProvider.sol";
@@ -22,7 +27,7 @@ import {CarryKeeper} from "custom/products/carryUSDC/CarryKeeper.sol";
 // Test-specific mocks (for scenario simulation only)
 import {MockChainlinkFeed} from "../mocks/MockChainlinkFeed.sol";
 import {MockMilkman} from "../mocks/MockMilkman.sol";
-import {MockZaibots} from "../mocks/MockZaibots.sol";
+import {MockAavePool} from "../mocks/MockAavePool.sol";
 
 /**
  * @title TestCarryUSDBase
@@ -144,6 +149,7 @@ abstract contract TestCarryUSDBase is Test {
     IERC20 public usdc;
     IERC20 public jUBC;
 
+    VaultV2 public vaultV2;
     address public morphoVault;
 
     // ═══════════════════════════════════════════════════════════════════
@@ -162,7 +168,7 @@ abstract contract TestCarryUSDBase is Test {
 
     MockChainlinkFeed public mockJpyUsdFeed;
     MockMilkman public mockMilkman;
-    MockZaibots public mockZaibots;
+    MockAavePool public mockPool;
     MockERC20 public mockUsdc;
     MockERC20 public mockJUBC;
 
@@ -307,15 +313,17 @@ abstract contract TestCarryUSDBase is Test {
 
         mockJpyUsdFeed = new MockChainlinkFeed(8, "JPY / USD", BASE_JPY_PRICE);
         mockMilkman = new MockMilkman();
-        mockZaibots = new MockZaibots();
-        mockZaibots.setLTV(address(mockUsdc), address(mockJUBC), 0.75e18);
-        mockZaibots.configureBorrowPair(address(mockJUBC), address(mockUsdc), address(mockJpyUsdFeed));
+        mockPool = new MockAavePool();
+        mockPool.initReserve(address(mockUsdc));
+        mockPool.initReserve(address(mockJUBC));
+        mockPool.setLTV(address(mockUsdc), address(mockJUBC), 0.75e18);
+        mockPool.configureBorrowPair(address(mockJUBC), address(mockUsdc), address(mockJpyUsdFeed));
         _setupMilkmanPrices();
 
         vm.stopPrank();
 
         config = CarryConfig({
-            zaibots: address(mockZaibots),
+            zaibots: address(mockPool),
             usdc: address(usdc),
             jUBC: address(jUBC),
             jpyUsdFeed: address(mockJpyUsdFeed),
@@ -388,9 +396,19 @@ abstract contract TestCarryUSDBase is Test {
             incParams
         );
 
-        address vaultAddr = config.morphoVault != address(0) ? config.morphoVault : address(1);
+        // Deploy real VaultV2 via factory (or use provided address for fork mode)
+        if (config.morphoVault == address(0)) {
+            VaultV2Factory factory = new VaultV2Factory();
+            address vaultAddr = factory.createVaultV2(owner, config.usdc, bytes32("test-carry"));
+            vaultV2 = VaultV2(vaultAddr);
+            morphoVault = vaultAddr;
+        } else {
+            morphoVault = config.morphoVault;
+            vaultV2 = VaultV2(morphoVault);
+        }
+
         carryAdapter = new CarryAdapter(
-            vaultAddr,
+            morphoVault,
             config.usdc,
             "conservative-usdc",
             address(twapOracle)
@@ -399,12 +417,52 @@ abstract contract TestCarryUSDBase is Test {
         carryAdapter.setStrategy(address(carryStrategy));
         carryStrategy.setAdapter(address(carryAdapter));
 
+        // Configure VaultV2: curator, adapter, allocator, caps
+        _configureVaultV2();
+
         carryKeeper = new CarryKeeper();
         carryKeeper.addStrategy(address(carryStrategy));
 
         vm.deal(address(carryStrategy), 10 ether);
 
         vm.stopPrank();
+    }
+
+    function _configureVaultV2() internal {
+        vaultV2.setCurator(owner);
+
+        // Submit + execute (zero timelock on fresh vaults)
+        vaultV2.submit(abi.encodeCall(IVaultV2.addAdapter, (address(carryAdapter))));
+        vaultV2.addAdapter(address(carryAdapter));
+
+        vaultV2.submit(abi.encodeCall(IVaultV2.setIsAllocator, (owner, true)));
+        vaultV2.setIsAllocator(owner, true);
+
+        uint256 maxCap = uint256(type(uint128).max);
+        _setAbsoluteCap(bytes("aave-protocol"), maxCap);
+        _setAbsoluteCap(bytes("jpy-fx-exposure"), maxCap);
+        _setAbsoluteCap(abi.encodePacked("strategy:", "conservative-usdc"), maxCap);
+    }
+
+    function _setAbsoluteCap(bytes memory idData, uint256 cap) internal {
+        vaultV2.submit(abi.encodeCall(IVaultV2.increaseAbsoluteCap, (idData, cap)));
+        vaultV2.increaseAbsoluteCap(idData, cap);
+    }
+
+    /// @notice Allocate assets from VaultV2 to the carry adapter
+    function _vaultAllocate(uint256 assets) internal {
+        vm.prank(owner);
+        vaultV2.allocate(address(carryAdapter), "", assets);
+    }
+
+    /// @notice Deposit assets into VaultV2 and allocate to carry adapter
+    function _vaultDepositAndAllocate(address depositor, uint256 depositAmount, uint256 allocateAmount) internal {
+        vm.startPrank(depositor);
+        IERC20(config.usdc).approve(address(vaultV2), depositAmount);
+        vaultV2.deposit(depositAmount, depositor);
+        vm.stopPrank();
+
+        _vaultAllocate(allocateAmount);
     }
 
     function _setupCarryPermissions() internal virtual {
@@ -433,11 +491,14 @@ abstract contract TestCarryUSDBase is Test {
         vm.label(address(carryKeeper), "CarryKeeper");
         vm.label(address(mockJpyUsdFeed), "MockJpyUsdFeed");
         vm.label(address(mockMilkman), "MockMilkman");
+        if (address(vaultV2) != address(0)) {
+            vm.label(address(vaultV2), "VaultV2");
+        }
         if (address(zaibots) != address(0)) {
             vm.label(address(zaibots), "Zaibots");
         }
-        if (address(mockZaibots) != address(0)) {
-            vm.label(address(mockZaibots), "MockZaibots");
+        if (address(mockPool) != address(0)) {
+            vm.label(address(mockPool), "MockAavePool");
         }
     }
 
@@ -448,8 +509,8 @@ abstract contract TestCarryUSDBase is Test {
             mockUsdc.mint(charlie, 100_000_000e6);
             mockUsdc.mint(address(mockMilkman), 1_000_000_000_000e6);
             mockJUBC.mint(address(mockMilkman), 1_000_000_000_000e18);
-            // Fund MockZaibots with jUBC for borrow liquidity
-            mockJUBC.mint(address(mockZaibots), 1_000_000_000_000e18);
+            // Fund MockAavePool with jUBC for borrow liquidity
+            mockJUBC.mint(address(mockPool), 1_000_000_000_000e18);
         } else {
             deal(address(usdc), alice, 100_000_000e6);
             deal(address(usdc), bob, 100_000_000e6);

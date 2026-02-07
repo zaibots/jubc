@@ -5,7 +5,7 @@ import {IERC20} from 'openzeppelin-contracts/contracts/token/ERC20/IERC20.sol';
 import {SafeERC20} from 'openzeppelin-contracts/contracts/token/ERC20/utils/SafeERC20.sol';
 import {Ownable} from 'openzeppelin-contracts/contracts/access/Ownable.sol';
 import {ReentrancyGuard} from 'openzeppelin-contracts/contracts/utils/ReentrancyGuard.sol';
-import {IVaultV2Adapter} from '../interfaces/IVaultV2Adapter.sol';
+import {IAdapter} from 'vault-v2/interfaces/IAdapter.sol';
 
 interface IMorphoVaultV1 {
   function deposit(uint256 assets, address receiver) external returns (uint256 shares);
@@ -19,12 +19,14 @@ interface IMorphoVaultV1 {
 /**
  * @title MorphoVaultV1Adapter
  * @notice Morpho Vault V2 adapter for liquid Morpho V1 vaults
+ * @dev Implements IAdapter from vault-v2. VaultV2 pushes tokens before allocate()
+ *      and pulls tokens after deallocate() via safeTransferFrom.
  */
-contract MorphoVaultV1Adapter is IVaultV2Adapter, Ownable, ReentrancyGuard {
+contract MorphoVaultV1Adapter is IAdapter, Ownable, ReentrancyGuard {
   using SafeERC20 for IERC20;
 
-  address public immutable override vault;
-  address public immutable override asset;
+  address public immutable vault;
+  address public immutable asset;
   IMorphoVaultV1 public immutable morphoV1Vault;
   uint256 public sharesHeld;
 
@@ -47,24 +49,25 @@ contract MorphoVaultV1Adapter is IVaultV2Adapter, Ownable, ReentrancyGuard {
     IERC20(asset).approve(_morphoV1Vault, type(uint256).max);
   }
 
-  function allocate(bytes memory data, uint256 assets, bytes4, address) external override onlyVault nonReentrant returns (bytes32[] memory _ids, int256 delta) {
-    IERC20(asset).safeTransferFrom(vault, address(this), assets);
+  /// @dev VaultV2 pushes tokens to this adapter before calling allocate().
+  function allocate(bytes memory, uint256 assets, bytes4, address) external override onlyVault nonReentrant returns (bytes32[] memory _ids, int256 change) {
+    // Tokens already at adapter — VaultV2 pushed before calling
     uint256 shares = morphoV1Vault.deposit(assets, address(this));
     sharesHeld += shares;
     _ids = ids();
-    delta = int256(assets);
-    emit Allocated(assets, data);
+    change = int256(assets);
   }
 
-  function deallocate(bytes memory data, uint256 assets, bytes4, address) external override onlyVault nonReentrant returns (bytes32[] memory _ids, int256 delta) {
+  /// @dev VaultV2 calls deallocate() then pulls tokens via safeTransferFrom.
+  function deallocate(bytes memory, uint256 assets, bytes4, address) external override onlyVault nonReentrant returns (bytes32[] memory _ids, int256 change) {
     if (assets > realAssets()) revert InsufficientAssets();
     uint256 sharesToBurn = morphoV1Vault.convertToShares(assets);
     uint256 withdrawn = morphoV1Vault.redeem(sharesToBurn, address(this), address(this));
     sharesHeld = sharesHeld > sharesToBurn ? sharesHeld - sharesToBurn : 0;
-    IERC20(asset).safeTransfer(vault, withdrawn);
+    // Approve vault to pull tokens after this call returns
+    IERC20(asset).forceApprove(vault, withdrawn);
     _ids = ids();
-    delta = -int256(withdrawn);
-    emit Deallocated(withdrawn, data);
+    change = -int256(withdrawn);
   }
 
   function realAssets() public view override returns (uint256) {
@@ -72,7 +75,7 @@ contract MorphoVaultV1Adapter is IVaultV2Adapter, Ownable, ReentrancyGuard {
     return morphoV1Vault.convertToAssets(sharesHeld);
   }
 
-  function ids() public pure override returns (bytes32[] memory) {
+  function ids() public pure returns (bytes32[] memory) {
     bytes32[] memory _ids = new bytes32[](1);
     _ids[0] = RISK_ID_ADAPTER;
     return _ids;
