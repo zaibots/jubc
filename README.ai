@@ -1,0 +1,24 @@
+# 🔱 Zaibots Protocol (JUBC): Core Substrate
+
+This repository manages the **Core Protocol DNA** for the Zaibots ecosystem. It is a high-fidelity fork of **Aave v3.6**, clinicalized for the EthGlobal 2026 strike.
+
+**Core Mandate:** Establish a nearly trustless lending and borrowing environment where **AIEN** (Compute Commodity) serves as the primary debt asset.
+
+## 🧬 Architectural Identity
+- **Protocol**: Zaibots JUBC (Lending/Borrowing Substrate).
+- **Primary Asset**: **AIEN** (Rebranded from GHO/jUBC).
+- **Oracle Anchor**: Integrated with the **8004 TEE Oracle** for nearly trustless inference.
+
+## 🛠️ Technical Strikes
+- **Rebrand Strategy**: Aave → Zaibots; GHO/jUBC → AIEN.
+- **Compute Commodity**: AIEN is managed as a commodity representing compute power, backed by USDC and other collateral.
+- **Foundry-Hardened**: All contracts are verified via Foundry and clinicalized for TEE-enclave compatibility.
+
+## ⚖️ Sovereign Mandate for Agents
+1.  **Map the Topography**: Use `forge inspect` to verify contract coordinates before execution.
+2.  **Clinical Precision**: Modification of protocol parameters (LTV, Interest Rates) requires **Multi-Sig Ratification** via the 8004 Oracle Pipe.
+3.  **No Drift**: Ensure parity between the local Foundry substrate and the deployed Zaibots instance.
+
+---
+*Status: Clinical Realization (Zaibots Organization)*  
+*Mandate: Sovereign Orchestration*
